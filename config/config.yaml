@@ -1,0 +1,92 @@
+# ===== J.A.R.V.I.S. Global Configuration =====
+
+identity:
+  name: "J.A.R.V.I.S."
+  soul_file: "./config/SOUL.md"
+  anchor_image: "./assets/identity/clawra_anchor_ref.png"
+
+models:
+  ceo:
+    primary:
+      provider: "nvidia"
+      model: "moonshotai/kimi-k2.5-instruct"
+      context_window: 262144  # 256K
+      rpm_limit: 40
+    backup:
+      provider: "openrouter"
+      model: "deepseek/deepseek-chat"
+      context_window: 65536   # 64K
+
+  vision:
+    primary:
+      provider: "zhipu"
+      model: "glm-4v-flash"
+    backup:
+      provider: "openrouter"
+      model: "google/gemini-2.0-flash-001"
+
+  image:
+    primary:
+      provider: "fal"
+      model: "fal-ai/flux-kontext/pro"
+      cost_per_image: 0.04
+    backup:
+      provider: "google"
+      model: "gemini-2.0-flash-exp"
+
+failover:
+  trigger:
+    consecutive_429: 2
+    timeout_seconds: 10
+    consecutive_5xx: 1
+  recovery:
+    check_interval_seconds: 300
+    healthy_checks_required: 3
+  context_bridging:
+    strategy: "truncate_and_summarize"
+    keep_recent_turns: 8
+    summary_max_tokens: 2000
+
+rate_limit:
+  nvidia:
+    rpm: 40
+    token_bucket_rate: 0.667  # tokens per second
+    max_backoff_seconds: 60
+    silent_mode:
+      threshold_per_hour: 10
+      cooldown_minutes: 15
+
+heartbeat:
+  hourly_patrol_interval_minutes: 60
+  morning_brief_time: "07:30"
+  health_check_interval_hours: 6
+  backup_time: "03:00"
+
+security:
+  confirm_operations:
+    - "payment"
+    - "bulk_delete"
+    - "external_message"
+    - "system_config"
+    - "unsigned_script"
+  auto_block:
+    - "path_traversal"
+    - "unauthorized_api"
+    - "identity_modification"
+  confirmation_timeout_seconds: 300
+
+memos:
+  database_path: "./data/memos.db"
+  token_saving_alert_threshold: 0.50
+
+backup:
+  schedule: "0 3 * * *"
+  retention_days: 7
+  destination: "./backups/"
+  encrypt: true
+
+logging:
+  level: "INFO"
+  file: "./data/logs/jarvis.log"
+  max_size_mb: 50
+  backup_count: 5

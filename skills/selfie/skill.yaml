@@ -1,0 +1,21 @@
+name: selfie
+display_name: Clawra 自拍
+version: "2.0"
+category: identity
+description: |
+  Generate a Clawra selfie using CORE_DNA_PROMPT + scene description.
+  Primary: fal.ai FLUX Kontext [pro] with reference image.
+  Backup: Google Gemini image generation (free tier).
+  Post-generation consistency check via vision model.
+  Cost: ~$0.04/image (FLUX Kontext [pro])
+
+input:
+  scene: "Scene description (e.g. 'holding coffee, afternoon light')"
+output:
+  image_url: "URL of the generated image"
+  consistency_score: "0.0-1.0 from vision model comparison"
+  cost_usd: "Generation cost in USD"
+
+dependencies:
+  - fal.ai API (FAL_KEY)
+  - google-generativeai (backup)

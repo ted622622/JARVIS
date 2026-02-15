@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+data/memos.db
+data/logs/
+data/selfies/
+backups/
+.venv/
+*.egg-info/
+dist/
+build/
+nul
+.claude/
+config/google_token_*.json
+config/google_credentials.json
+skills/skills_index.json

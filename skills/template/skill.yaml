@@ -1,0 +1,14 @@
+name: template
+display_name: Template Skill
+version: "1.0"
+category: example
+description: |
+  A reference template for creating new skills.
+  Copy this directory and modify to create your own skill.
+
+input:
+  message: "A text message to echo back"
+output:
+  result: "The echoed message with a timestamp"
+
+dependencies: []
