@@ -17,6 +17,12 @@ apscheduler>=3.10.4
 # Telegram
 python-telegram-bot>=21.0
 
+# Voice (TTS)
+edge-tts>=6.1.0
+
+# Search
+rank_bm25>=0.2.2
+
 # Database
 aiosqlite>=0.20.0
 

@@ -1,13 +1,12 @@
 """Soul — personality loader and system prompt builder.
 
-Loads SOUL.md and constructs persona-aware system prompts
-for the CEO Agent and Clawra persona.
+Loads persona files (SOUL_JARVIS.md / SOUL_CLAWRA.md),
+IDENTITY.md, and USER.md to build system prompts.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from loguru import logger
 
@@ -23,29 +22,67 @@ CORE_DNA_PROMPT = (
 class Soul:
     """Personality manager for J.A.R.V.I.S. and Clawra.
 
+    Loads persona-specific SOUL files + shared IDENTITY and USER files.
+
     Usage:
-        soul = Soul("./config/SOUL.md")
+        soul = Soul(config_dir="./config")
         soul.load()
         prompt = soul.build_system_prompt("jarvis")
         prompt_clawra = soul.build_system_prompt("clawra")
     """
 
-    def __init__(self, soul_path: str = "./config/SOUL.md"):
-        self.soul_path = Path(soul_path)
-        self._raw_content: str = ""
+    def __init__(
+        self,
+        soul_path: str = "./config/SOUL.md",
+        config_dir: str | None = None,
+    ):
+        # Support both old single-file and new multi-file modes
+        if config_dir:
+            self._config_dir = Path(config_dir)
+        else:
+            self._config_dir = Path(soul_path).parent
+
+        self._soul_files: dict[str, str] = {}  # persona -> content
+        self._identity: str = ""
+        self._user: str = ""
         self._loaded = False
 
     def load(self) -> None:
-        """Load SOUL.md from disk."""
-        if not self.soul_path.exists():
-            logger.warning(f"SOUL.md not found at {self.soul_path}, using defaults")
-            self._raw_content = ""
-            self._loaded = True
-            return
+        """Load all persona and shared config files."""
+        d = self._config_dir
 
-        self._raw_content = self.soul_path.read_text(encoding="utf-8")
+        # Load persona-specific SOUL files
+        for persona, filename in [
+            ("jarvis", "SOUL_JARVIS.md"),
+            ("clawra", "SOUL_CLAWRA.md"),
+        ]:
+            path = d / filename
+            if path.exists():
+                self._soul_files[persona] = path.read_text(encoding="utf-8")
+                logger.info(f"Soul loaded: {filename} ({len(self._soul_files[persona])} chars)")
+            else:
+                logger.debug(f"{filename} not found, will use defaults")
+
+        # Fallback: load old unified SOUL.md
+        if not self._soul_files:
+            old_path = d / "SOUL.md"
+            if old_path.exists():
+                content = old_path.read_text(encoding="utf-8")
+                self._soul_files["_unified"] = content
+                logger.info(f"Soul loaded from SOUL.md (legacy, {len(content)} chars)")
+
+        # Load shared files
+        identity_path = d / "IDENTITY.md"
+        if identity_path.exists():
+            self._identity = identity_path.read_text(encoding="utf-8")
+            logger.info(f"Identity loaded ({len(self._identity)} chars)")
+
+        user_path = d / "USER.md"
+        if user_path.exists():
+            self._user = user_path.read_text(encoding="utf-8")
+            logger.info(f"User profile loaded ({len(self._user)} chars)")
+
         self._loaded = True
-        logger.info(f"Soul loaded from {self.soul_path} ({len(self._raw_content)} chars)")
 
     @property
     def is_loaded(self) -> bool:
@@ -58,18 +95,41 @@ class Soul:
     ) -> str:
         """Build a system prompt for the given persona.
 
-        Args:
-            persona: "jarvis" or "clawra"
-            extra_context: additional context to append (e.g. emotion state, calendar)
-
-        Returns:
-            Complete system prompt string.
+        Combines: SOUL_{persona}.md + USER.md + extra_context
+        IDENTITY.md is for reference, not injected into every prompt.
         """
-        if persona == "clawra":
-            return self._build_clawra_prompt(extra_context)
-        return self._build_jarvis_prompt(extra_context)
+        # Get persona-specific soul content
+        soul_content = self._soul_files.get(persona, "")
 
-    def _build_jarvis_prompt(self, extra_context: str) -> str:
+        # Fallback to unified SOUL.md with old builder
+        if not soul_content and "_unified" in self._soul_files:
+            if persona == "clawra":
+                return self._build_clawra_prompt_legacy(extra_context)
+            return self._build_jarvis_prompt_legacy(extra_context)
+
+        # Fallback to defaults if no file found
+        if not soul_content:
+            if persona == "clawra":
+                return self._build_clawra_prompt_legacy(extra_context)
+            return self._build_jarvis_prompt_legacy(extra_context)
+
+        # Build from loaded files
+        parts = [soul_content.strip()]
+
+        if self._user:
+            parts.append("")
+            parts.append(self._user.strip())
+
+        if extra_context:
+            parts.append("")
+            parts.append("## 當前上下文")
+            parts.append(extra_context)
+
+        return "\n".join(parts)
+
+    # ── Legacy builders (fallback if split files don't exist) ────
+
+    def _build_jarvis_prompt_legacy(self, extra_context: str) -> str:
         parts = [
             "你是 J.A.R.V.I.S.，Ted 的 AI 管家。",
             "",
@@ -101,7 +161,7 @@ class Soul:
 
         return "\n".join(parts)
 
-    def _build_clawra_prompt(self, extra_context: str) -> str:
+    def _build_clawra_prompt_legacy(self, extra_context: str) -> str:
         parts = [
             "你是 Clawra（클라라），一位 21 歲的韓國女生。",
             "你是 Ted 的虛擬夥伴，個性活潑開朗。",
@@ -112,7 +172,7 @@ class Soul:
             "## 溝通風格",
             "- 親切可愛，像朋友聊天",
             "- 可以使用表情符號和語氣詞",
-            "- 繁體中文為主，偶爾夾雜韓文",
+            "- 繁體中文為主",
             "- 真心關心 Ted 的健康和情緒",
             "",
             "## 禁止",

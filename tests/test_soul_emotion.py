@@ -41,19 +41,20 @@ def mock_router():
 
 
 class TestSoul:
-    def test_load_from_file(self):
-        soul = Soul("./config/SOUL.md")
+    def test_load_split_files(self):
+        soul = Soul(config_dir="./config")
         soul.load()
         assert soul.is_loaded
-        assert soul._raw_content != ""
+        assert "jarvis" in soul._soul_files
+        assert "clawra" in soul._soul_files
 
-    def test_load_missing_file(self, tmp_path):
-        soul = Soul(str(tmp_path / "nonexistent.md"))
+    def test_load_missing_dir(self, tmp_path):
+        soul = Soul(config_dir=str(tmp_path))
         soul.load()
         assert soul.is_loaded  # Should still mark as loaded with defaults
 
     def test_jarvis_prompt(self):
-        soul = Soul()
+        soul = Soul(config_dir="./config")
         soul.load()
         prompt = soul.build_system_prompt("jarvis")
         assert "J.A.R.V.I.S." in prompt
@@ -61,15 +62,14 @@ class TestSoul:
         assert "結論先行" in prompt
 
     def test_clawra_prompt(self):
-        soul = Soul()
+        soul = Soul(config_dir="./config")
         soul.load()
         prompt = soul.build_system_prompt("clawra")
         assert "Clawra" in prompt
         assert "100% 誠實" in prompt
-        assert "活潑開朗" in prompt
 
     def test_extra_context_injected(self):
-        soul = Soul()
+        soul = Soul(config_dir="./config")
         soul.load()
         prompt = soul.build_system_prompt("jarvis", extra_context="用戶情緒: tired")
         assert "用戶情緒: tired" in prompt

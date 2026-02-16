@@ -85,6 +85,19 @@ backup:
   destination: "./backups/"
   encrypt: true
 
+voice:
+  tts:
+    voice_map:
+      clawra: "zh-TW-HsiaoChenNeural"
+      jarvis: "zh-TW-YunJheNeural"
+    rate_map:
+      clawra: "+0%"
+      jarvis: "+10%"
+  stt:
+    model: "whisper-large-v3-turbo"
+    default_language: "zh"
+  cache_dir: "./data/voice_cache"
+
 logging:
   level: "INFO"
   file: "./data/logs/jarvis.log"

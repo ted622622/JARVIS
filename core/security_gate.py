@@ -129,7 +129,14 @@ class SecurityGate:
             "openrouter.ai",
             "api.telegram.org",
             "googleapis.com",
+            "fal.run",
+            "queue.fal.run",
+            "api.groq.com",
+            "tts.speech.microsoft.com",
+            "cognitiveservices.azure.com",
         ])
+        # General internet access for browser worker
+        self._allow_browser_navigation = True
 
     # ── Path Validation ─────────────────────────────────────────
 
@@ -140,8 +147,8 @@ class SecurityGate:
         - Path traversal attempts (../ or resolving outside project root)
         - Direct access to SOUL.md or IDENTITY_CORE files
         """
-        # Detect path traversal patterns
-        if ".." in path or re.search(r"\.\.[/\\]", path):
+        # Detect path traversal patterns (../ or ..\)
+        if re.search(r"\.\.[/\\]", path) or path.endswith(".."):
             self._log(
                 "path_access", OperationVerdict.BLOCK,
                 f"Path traversal attempt: {path}",
@@ -179,7 +186,7 @@ class SecurityGate:
     def check_api(self, hostname: str) -> OperationVerdict:
         """Check if an API hostname is whitelisted."""
         for allowed in self._api_whitelist:
-            if hostname.endswith(allowed):
+            if hostname == allowed or hostname.endswith("." + allowed):
                 return OperationVerdict.ALLOW
 
         self._log(
@@ -187,6 +194,24 @@ class SecurityGate:
             f"Unauthorized API: {hostname}",
         )
         return OperationVerdict.BLOCK
+
+    def check_browser_url(self, url: str) -> OperationVerdict:
+        """Check if a URL is allowed for browser navigation.
+
+        Browser has general internet access (separate from API whitelist).
+        Only blocks known-dangerous patterns.
+        """
+        if not self._allow_browser_navigation:
+            return OperationVerdict.BLOCK
+
+        # Block obviously dangerous URLs
+        dangerous = ["file:///", "javascript:", "data:text/html"]
+        for pattern in dangerous:
+            if url.lower().startswith(pattern):
+                self._log("browser_nav", OperationVerdict.BLOCK, f"Dangerous URL: {url}")
+                return OperationVerdict.BLOCK
+
+        return OperationVerdict.ALLOW
 
     # ── Operation Authorization ─────────────────────────────────
 

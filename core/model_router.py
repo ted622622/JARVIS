@@ -72,7 +72,7 @@ class ModelRouter:
         }
         self._failover_trigger_429 = failover_cfg.get("trigger", {}).get("consecutive_429", 2)
         self._failover_trigger_5xx = failover_cfg.get("trigger", {}).get("consecutive_5xx", 1)
-        self._recovery_interval = failover_cfg.get("recovery", {}).get("check_interval_seconds", 300)
+        self._recovery_interval = failover_cfg.get("recovery", {}).get("check_interval_seconds", 1800)
         self._healthy_checks_required = failover_cfg.get("recovery", {}).get("healthy_checks_required", 3)
         self._last_recovery_check: dict[str, float] = {}
         self._recovery_healthy_count: dict[str, int] = {}
@@ -84,6 +84,9 @@ class ModelRouter:
 
         # Failover event history
         self._failover_events: list[FailoverEvent] = []
+
+        # Lock for provider status mutations
+        self._status_lock = asyncio.Lock()
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -101,14 +104,14 @@ class ModelRouter:
         if self._provider_status.get(self._provider_name(primary)) != ProviderStatus.DOWN:
             try:
                 response = await primary.chat(messages, **kwargs)
-                self._on_success(self._provider_name(primary))
+                await self._on_success(self._provider_name(primary))
                 return response
             except RateLimitExceeded:
                 logger.warning(f"Primary provider in silent mode for role={role.value}")
-                self._mark_down(self._provider_name(primary))
+                await self._mark_down(self._provider_name(primary))
             except Exception as e:
                 logger.warning(f"Primary failed for role={role.value}: {e}")
-                self._handle_failure(self._provider_name(primary), e)
+                await self._handle_failure(self._provider_name(primary), e)
 
         # Fallback to backup
         if backup is None:
@@ -148,7 +151,7 @@ class ModelRouter:
                 return await self.zhipu.vision_analyze(image_url, prompt, **kwargs)
             except Exception as e:
                 logger.warning(f"Vision primary failed: {e}")
-                self._mark_down("zhipu")
+                await self._mark_down("zhipu")
 
         # Fallback to Gemini via OpenRouter
         messages = [
@@ -249,24 +252,34 @@ class ModelRouter:
     def _get_client_by_name(self, name: str):
         return {"nvidia": self.nvidia, "zhipu": self.zhipu, "openrouter": self.openrouter}.get(name)
 
-    def _on_success(self, provider: str) -> None:
-        self._consecutive_429[provider] = 0
-        self._consecutive_5xx[provider] = 0
+    async def _on_success(self, provider: str) -> None:
+        async with self._status_lock:
+            self._consecutive_429[provider] = 0
+            self._consecutive_5xx[provider] = 0
 
-    def _handle_failure(self, provider: str, error: Exception) -> None:
-        error_str = str(error)
-        if "429" in error_str:
-            count = self._consecutive_429.get(provider, 0) + 1
-            self._consecutive_429[provider] = count
-            if count >= self._failover_trigger_429:
-                self._mark_down(provider)
-        elif "500" in error_str or "502" in error_str or "503" in error_str:
-            count = self._consecutive_5xx.get(provider, 0) + 1
-            self._consecutive_5xx[provider] = count
-            if count >= self._failover_trigger_5xx:
-                self._mark_down(provider)
+    async def _handle_failure(self, provider: str, error: Exception) -> None:
+        async with self._status_lock:
+            error_str = str(error)
+            if "429" in error_str or isinstance(error, RateLimitExceeded):
+                count = self._consecutive_429.get(provider, 0) + 1
+                self._consecutive_429[provider] = count
+                if count >= self._failover_trigger_429:
+                    self._do_mark_down(provider)
+            elif "404" in error_str:
+                # Model endpoint not found — immediately mark down
+                self._do_mark_down(provider)
+            elif "500" in error_str or "502" in error_str or "503" in error_str:
+                count = self._consecutive_5xx.get(provider, 0) + 1
+                self._consecutive_5xx[provider] = count
+                if count >= self._failover_trigger_5xx:
+                    self._do_mark_down(provider)
 
-    def _mark_down(self, provider: str) -> None:
+    async def _mark_down(self, provider: str) -> None:
+        async with self._status_lock:
+            self._do_mark_down(provider)
+
+    def _do_mark_down(self, provider: str) -> None:
+        """Internal mark-down without lock (caller must hold _status_lock)."""
         if self._provider_status.get(provider) != ProviderStatus.DOWN:
             self._provider_status[provider] = ProviderStatus.DOWN
             self._recovery_healthy_count[provider] = 0

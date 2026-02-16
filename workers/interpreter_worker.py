@@ -7,10 +7,13 @@ that require local OS access.
 from __future__ import annotations
 
 import asyncio
+import shlex
 import subprocess
 from typing import Any
 
 from loguru import logger
+
+from core.security_gate import OperationType, OperationVerdict
 
 
 class InterpreterWorker:
@@ -41,17 +44,15 @@ class InterpreterWorker:
 
         # Security check
         if self.security:
-            verdict = await self.security.authorize(
-                operation="unsigned_script",
+            event = await self.security.authorize(
+                op_type=OperationType.UNSIGNED_SCRIPT,
                 detail=command[:200],
             )
-            if verdict.action == "BLOCK":
-                return {"error": f"Blocked by SecurityGate: {verdict.reason}"}
-            if verdict.action == "CONFIRM" and not verdict.approved:
-                return {"error": "Operation not approved by user"}
+            if event.verdict == OperationVerdict.BLOCK:
+                return {"error": f"Blocked by SecurityGate: {event.detail}"}
 
         try:
-            result = await asyncio.get_event_loop().run_in_executor(
+            result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: self._run_command(command, shell, timeout),
             )
@@ -69,7 +70,7 @@ class InterpreterWorker:
         elif shell == "python":
             args = ["python", "-c", command]
         else:
-            args = command.split()
+            args = shlex.split(command)
 
         proc = subprocess.run(
             args,

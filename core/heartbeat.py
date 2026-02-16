@@ -40,12 +40,18 @@ class Heartbeat:
         telegram: Any = None,
         survival_gate: Any = None,
         config: dict[str, Any] | None = None,
+        weather_client: Any = None,
+        pending_tasks: Any = None,
+        react_executor: Any = None,
     ):
         self.router = model_router
         self.memos = memos
         self.telegram = telegram
         self.survival = survival_gate
         self.config = config or {}
+        self.weather = weather_client
+        self.pending = pending_tasks
+        self.react = react_executor
 
         self.scheduler = AsyncIOScheduler()
         self._running = False
@@ -107,6 +113,16 @@ class Heartbeat:
             id="night_owl",
             name="Night Owl Detection",
         )
+
+        # Pending task retry (Patch H)
+        if self.pending:
+            self.scheduler.add_job(
+                self.retry_pending_tasks,
+                "interval",
+                minutes=15,
+                id="pending_tasks",
+                name="Pending Task Retry",
+            )
 
         self.scheduler.start()
         self._running = True
@@ -231,7 +247,7 @@ class Heartbeat:
         # Also probe recovery for any downed providers
         if self.router:
             recovery = await self.router.probe_recovery()
-            if recovery:
+            if recovery and self.telegram:
                 for provider, status in recovery.items():
                     if status == "recovered":
                         await self.telegram.send(f"✅ {provider} 已恢復正常服務")
@@ -302,6 +318,58 @@ class Heartbeat:
                     return True
         return False
 
+    async def retry_pending_tasks(self) -> dict[str, Any]:
+        """Retry pending tasks via ReactExecutor.
+
+        Returns summary dict for testing.
+        """
+        if not self.pending or not self.react:
+            return {"retried": 0, "succeeded": 0, "failed": 0}
+
+        due = self.pending.get_due_tasks()
+        if not due:
+            return {"retried": 0, "succeeded": 0, "failed": 0}
+
+        succeeded = 0
+        failed = 0
+
+        for task in due:
+            try:
+                result = await self.react.execute(
+                    task.task_type, task.task_description, **task.kwargs,
+                )
+                if result.success:
+                    self.pending.mark_completed(task.task_id)
+                    succeeded += 1
+                    logger.info(f"Pending task {task.task_id} succeeded on retry")
+                    if self.telegram:
+                        await self.telegram.send(
+                            f"✅ 待辦任務完成: {task.task_description[:60]}"
+                        )
+                else:
+                    self.pending.mark_failed(task.task_id, result.gave_up_reason)
+                    failed += 1
+            except Exception as e:
+                self.pending.mark_failed(task.task_id, str(e))
+                failed += 1
+                logger.warning(f"Pending task {task.task_id} retry error: {e}")
+
+        # Notify about given-up tasks
+        given_up = self.pending.get_given_up_tasks()
+        if given_up and self.telegram:
+            for task in given_up:
+                await self.telegram.send(
+                    f"❌ 任務放棄: {task.task_description[:60]}\n"
+                    f"原因: {task.last_error[:100]}"
+                )
+            self.pending.clear_given_up()
+
+        self.pending.save()
+
+        summary = {"retried": len(due), "succeeded": succeeded, "failed": failed}
+        logger.info(f"Pending task retry: {summary}")
+        return summary
+
     # ── Helpers ──────────────────────────────────────────────────
 
     def _should_reach_out(
@@ -354,9 +422,10 @@ class Heartbeat:
             return None
 
     async def _fetch_weather(self) -> str:
-        """Fetch weather info. Placeholder until weather API is integrated."""
-        # TODO: Integrate real weather API (Task 6 or later)
-        return "天氣資訊尚未接入（待整合天氣 API）"
+        """Fetch weather via Open-Meteo."""
+        if self.weather:
+            return await self.weather.get_brief()
+        return "天氣資訊尚未接入"
 
     async def _get_today_agenda(self) -> list[str]:
         """Get today's calendar events from MemOS cache."""

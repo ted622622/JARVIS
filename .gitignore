@@ -4,7 +4,12 @@ __pycache__/
 data/memos.db
 data/logs/
 data/selfies/
+data/chrome_profile_jarvis/
+data/voice_cache/
 backups/
+memory/daily/
+memory/sessions/
+memory/MEMORY.md
 .venv/
 *.egg-info/
 dist/

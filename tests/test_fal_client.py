@@ -30,7 +30,7 @@ class TestFalClient:
     def test_init(self):
         client = FalClient(api_key="key-test")
         assert client.api_key == "key-test"
-        assert "flux-kontext" in client.model
+        assert "kontext" in client.model
 
     def test_custom_model(self):
         client = FalClient(api_key="key", model="fal-ai/flux-schnell")

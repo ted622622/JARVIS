@@ -18,7 +18,7 @@ from loguru import logger
 # fal.ai endpoints
 FAL_RUN_BASE = "https://fal.run"
 FAL_QUEUE_BASE = "https://queue.fal.run"
-FLUX_KONTEXT_PRO = "fal-ai/flux-kontext/pro"
+FLUX_KONTEXT_PRO = "fal-ai/flux-pro/kontext"
 
 
 @dataclass

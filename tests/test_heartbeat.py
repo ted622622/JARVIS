@@ -408,3 +408,164 @@ class TestTelegramClient:
         from clients.telegram_client import TelegramClient
         client = TelegramClient()
         await client.close()  # Should not raise
+
+    def test_whitelist_parsing(self):
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient(allowed_user_ids="123,456,789")
+        assert client._allowed_user_ids == {123, 456, 789}
+
+    def test_whitelist_empty_allows_all(self):
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient(allowed_user_ids="")
+        assert client._is_authorized(99999) is True
+
+    def test_whitelist_authorized_user(self):
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient(allowed_user_ids="123,456")
+        assert client._is_authorized(123) is True
+        assert client._is_authorized(456) is True
+
+    def test_whitelist_unauthorized_user(self):
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient(allowed_user_ids="123,456")
+        assert client._is_authorized(789) is False
+        assert client._is_authorized(None) is False
+
+    @pytest.mark.asyncio
+    async def test_typing_delay_clawra_short_text(self):
+        """Typing delay should be at least 12s (15 - 3 jitter)."""
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient()
+        mock_bot = AsyncMock()
+
+        start = time.monotonic()
+        # Patch asyncio.sleep to skip actual waiting
+        with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await client._simulate_typing(mock_bot, 123, "短訊息")
+            total_delay = sum(call.args[0] for call in mock_sleep.call_args_list)
+            assert 12 <= total_delay <= 60
+            mock_bot.send_chat_action.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_typing_delay_clawra_long_text(self):
+        """Long text should push delay toward 60s cap."""
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient()
+        mock_bot = AsyncMock()
+
+        long_text = "很長的回覆" * 50  # 150 chars → 15 + 150*0.3 = 60, capped
+        with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await client._simulate_typing(mock_bot, 123, long_text)
+            total_delay = sum(call.args[0] for call in mock_sleep.call_args_list)
+            assert 50 <= total_delay <= 63  # near cap with jitter
+
+    @pytest.mark.asyncio
+    async def test_typing_action_sent_periodically(self):
+        """Chat action should be sent multiple times during delay."""
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient()
+        mock_bot = AsyncMock()
+
+        # Medium text: ~30s delay → should send typing ~7-8 times
+        medium_text = "中等長度" * 15  # 60 chars → 15 + 60*0.3 = 33s
+        with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock):
+            await client._simulate_typing(mock_bot, 123, medium_text)
+            assert mock_bot.send_chat_action.call_count >= 4
+            mock_bot.send_chat_action.assert_called_with(chat_id=123, action="typing")
+
+
+# ── Pending Task Retry Tests ──────────────────────────────────────
+
+
+class TestPendingTaskRetry:
+    @pytest.fixture
+    def mock_react(self):
+        from core.react_executor import TaskResult
+        react = AsyncMock()
+        react.execute.return_value = TaskResult(success=True, result={"content": "ok"})
+        return react
+
+    @pytest.fixture
+    def pending_mgr(self, tmp_path):
+        from core.pending_tasks import PendingTaskManager
+        return PendingTaskManager(str(tmp_path / "pending.json"))
+
+    @pytest.mark.asyncio
+    async def test_retry_succeeds(self, mock_telegram, mock_react, pending_mgr):
+        tid = pending_mgr.add("web_search", "查天氣")
+        hb = Heartbeat(
+            telegram=mock_telegram,
+            pending_tasks=pending_mgr,
+            react_executor=mock_react,
+        )
+        result = await hb.retry_pending_tasks()
+        assert result["retried"] == 1
+        assert result["succeeded"] == 1
+        mock_telegram.send.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_fails(self, mock_telegram, pending_mgr):
+        from core.react_executor import TaskResult
+        mock_react = AsyncMock()
+        mock_react.execute.return_value = TaskResult(
+            success=False, gave_up_reason="all_workers_exhausted",
+        )
+        tid = pending_mgr.add("web_search", "查天氣")
+        hb = Heartbeat(
+            telegram=mock_telegram,
+            pending_tasks=pending_mgr,
+            react_executor=mock_react,
+        )
+        result = await hb.retry_pending_tasks()
+        assert result["retried"] == 1
+        assert result["failed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_no_pending(self, mock_telegram, mock_react, pending_mgr):
+        hb = Heartbeat(
+            telegram=mock_telegram,
+            pending_tasks=pending_mgr,
+            react_executor=mock_react,
+        )
+        result = await hb.retry_pending_tasks()
+        assert result["retried"] == 0
+
+    @pytest.mark.asyncio
+    async def test_retry_given_up_notifies(self, mock_telegram, pending_mgr):
+        from core.react_executor import TaskResult
+        mock_react = AsyncMock()
+        mock_react.execute.return_value = TaskResult(
+            success=False, gave_up_reason="all_workers_exhausted",
+        )
+        tid = pending_mgr.add("web_search", "查天氣")
+        # Set retry_count to max_retries - 1 so next failure gives up
+        pending_mgr._tasks[tid].retry_count = 2
+
+        hb = Heartbeat(
+            telegram=mock_telegram,
+            pending_tasks=pending_mgr,
+            react_executor=mock_react,
+        )
+        await hb.retry_pending_tasks()
+        # Should have notified about given-up task
+        calls = [str(c) for c in mock_telegram.send.call_args_list]
+        assert any("放棄" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_has_pending_job(self, pending_mgr, mock_react):
+        hb = Heartbeat(
+            pending_tasks=pending_mgr,
+            react_executor=mock_react,
+        )
+        hb.start()
+        job_ids = [j["id"] for j in hb.get_jobs()]
+        assert "pending_tasks" in job_ids
+        hb.stop()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_no_pending_job_without_manager(self):
+        hb = Heartbeat()
+        hb.start()
+        job_ids = [j["id"] for j in hb.get_jobs()]
+        assert "pending_tasks" not in job_ids
+        hb.stop()

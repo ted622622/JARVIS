@@ -109,9 +109,12 @@ class NvidiaClient(BaseClient):
                     logger.warning(f"{resp.status_code} from NVIDIA NIM, backoff {backoff}s")
 
                 else:
-                    resp.raise_for_status()
+                    # 4xx (except 429) — not retryable, raise immediately
+                    raise NvidiaAPIError(
+                        f"{resp.status_code} from NVIDIA NIM: {resp.text[:200]}"
+                    )
 
-            except (RateLimitExceeded, KeyboardInterrupt):
+            except (RateLimitExceeded, NvidiaAPIError, KeyboardInterrupt):
                 raise
             except Exception as e:
                 if attempt == max_retries:

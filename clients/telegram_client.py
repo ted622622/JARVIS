@@ -3,13 +3,18 @@
 Features:
 - Send text messages (Markdown)
 - Send photos with captions
+- Send / receive voice messages (TTS + STT)
 - Inline keyboard Y/N confirmation (for SecurityGate)
 - Callback query handling
+- Clawra typing delay for humanization
 """
 
 from __future__ import annotations
 
 import asyncio
+import random
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -50,18 +55,39 @@ class TelegramClient:
         jarvis_token: str = "",
         clawra_token: str = "",
         chat_id: int | str = 0,
+        allowed_user_ids: str = "",
     ):
         self._jarvis_token = jarvis_token
         self._clawra_token = clawra_token
         self.chat_id = int(chat_id) if chat_id else 0
 
+        # Whitelist: only these user IDs can interact
+        self._allowed_user_ids: set[int] = set()
+        if allowed_user_ids:
+            for uid in allowed_user_ids.split(","):
+                uid = uid.strip()
+                if uid.isdigit():
+                    self._allowed_user_ids.add(int(uid))
+
         self._jarvis_bot: Bot | None = None
         self._clawra_bot: Bot | None = None
-        self._app: Application | None = None
+        self._jarvis_app: Application | None = None
+        self._clawra_app: Application | None = None
 
         # Pending confirmation callbacks: {callback_id: asyncio.Future}
         self._pending_confirms: dict[str, asyncio.Future] = {}
         self._confirm_counter = 0
+
+        # Message handler callback: async fn(user_message: str, chat_id: int, persona: str) -> str
+        self._on_message = None
+        # Map bot token → persona for incoming message routing
+        self._token_to_persona: dict[str, str] = {}
+
+        # Voice components (injected after init)
+        self._voice_worker = None
+        self._stt_client = None
+        self._voice_cache_dir = Path("./data/voice_cache")
+        self._voice_cache_dir.mkdir(parents=True, exist_ok=True)
 
     async def init(self) -> None:
         """Initialize bot instances."""
@@ -76,6 +102,22 @@ class TelegramClient:
         if self._clawra_token:
             self._clawra_bot = Bot(token=self._clawra_token)
             logger.info("Clawra Telegram bot initialized")
+
+    @property
+    def voice_worker(self):
+        return self._voice_worker
+
+    @voice_worker.setter
+    def voice_worker(self, worker) -> None:
+        self._voice_worker = worker
+
+    @property
+    def stt_client(self):
+        return self._stt_client
+
+    @stt_client.setter
+    def stt_client(self, client) -> None:
+        self._stt_client = client
 
     def _get_bot(self, persona: str = "jarvis") -> Bot | None:
         if persona == "clawra" and self._clawra_bot:
@@ -142,6 +184,39 @@ class TelegramClient:
             logger.error(f"Failed to send Telegram photo: {e}")
             return None
 
+    async def send_voice(
+        self,
+        audio_path: str,
+        *,
+        persona: str = "jarvis",
+        chat_id: int | None = None,
+    ) -> int | None:
+        """Send a voice message from a local audio file.
+
+        Args:
+            audio_path: Path to the audio file (MP3/OGA)
+            persona: Which bot sends it
+            chat_id: Target chat (defaults to self.chat_id)
+
+        Returns:
+            message_id on success, None on failure
+        """
+        bot = self._get_bot(persona)
+        if not bot:
+            return None
+
+        target = chat_id or self.chat_id
+        if not target:
+            return None
+
+        try:
+            with open(audio_path, "rb") as f:
+                msg = await bot.send_voice(chat_id=target, voice=f)
+            return msg.message_id
+        except Exception as e:
+            logger.error(f"Failed to send voice message: {e}")
+            return None
+
     # ── Confirmation Flow (for SecurityGate) ────────────────────
 
     async def request_confirmation(
@@ -197,6 +272,12 @@ class TelegramClient:
         if not query or not query.data:
             return
 
+        # Whitelist check
+        user_id = query.from_user.id if query.from_user else None
+        if not self._is_authorized(user_id):
+            logger.warning(f"Unauthorized callback from user {user_id} blocked")
+            return
+
         await query.answer()
         data = query.data  # e.g. "confirm_1_yes" or "confirm_1_no"
 
@@ -218,22 +299,233 @@ class TelegramClient:
 
     # ── Polling (for standalone operation) ──────────────────────
 
-    def build_application(self, token: str | None = None) -> Application | None:
-        """Build a telegram Application with handlers for polling mode.
+    def set_message_handler(self, callback) -> None:
+        """Set the callback for incoming user messages.
 
-        Call this if you want to run the bot with long-polling.
+        Args:
+            callback: async fn(user_message: str, chat_id: int) -> str
+        """
+        self._on_message = callback
+
+    def _is_authorized(self, user_id: int | None) -> bool:
+        """Check if a user ID is in the whitelist."""
+        if not self._allowed_user_ids:
+            return True  # No whitelist configured → allow all
+        return user_id in self._allowed_user_ids
+
+    async def _simulate_typing(
+        self, bot: Any, chat_id: int, text: str,
+    ) -> None:
+        """Simulate human typing delay for Clawra persona.
+
+        Delay is 15–60 seconds, scaled by response length.
+        Sends 'typing' chat action every 4s so the indicator stays visible.
+        """
+        # ~0.3s per character, clamped to [15, 60], with a small random jitter
+        base = min(15 + len(text) * 0.3, 60)
+        delay = base + random.uniform(-3, 3)
+        delay = max(15, min(delay, 60))
+        logger.debug(f"Clawra typing delay: {delay:.1f}s for {len(text)} chars")
+
+        elapsed = 0.0
+        while elapsed < delay:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action="typing")
+            except Exception:
+                pass  # non-critical
+            wait = min(4.0, delay - elapsed)
+            await asyncio.sleep(wait)
+            elapsed += wait
+
+    async def _handle_text_message(self, update: Update, context: Any) -> None:
+        """Process incoming text messages from users."""
+        if not update.message or not update.message.text:
+            return
+
+        # Whitelist check — must be first
+        user_id = update.message.from_user.id if update.message.from_user else None
+        if not self._is_authorized(user_id):
+            logger.warning(f"Unauthorized user {user_id} blocked")
+            return  # Silent drop
+
+        chat_id = update.message.chat_id
+        user_text = update.message.text
+        user_name = update.message.from_user.first_name if update.message.from_user else "User"
+
+        # Determine which persona received this message
+        bot_token = context.bot.token
+        persona = self._token_to_persona.get(bot_token, "jarvis")
+
+        logger.info(f"[{persona}] Telegram received from {user_name}: {user_text[:80]}")
+
+        if not self._on_message:
+            await update.message.reply_text("收到，但 CEO Agent 尚未就緒。")
+            return
+
+        try:
+            reply = await self._on_message(user_text, chat_id, persona)
+
+            # Clawra typing delay — humanize response timing
+            if persona == "clawra":
+                reply_text = reply.get("text", "") if isinstance(reply, dict) else (reply or "")
+                await self._simulate_typing(context.bot, chat_id, reply_text)
+
+            if isinstance(reply, dict):
+                # Rich reply — may include photo
+                photo_url = reply.get("photo_url")
+                text = reply.get("text", "")
+                if photo_url:
+                    try:
+                        await update.message.reply_photo(photo=photo_url, caption=text or None)
+                    except Exception as e:
+                        logger.warning(f"Failed to send photo, sending as text: {e}")
+                        await update.message.reply_text(text or "（無回覆）")
+                else:
+                    await update.message.reply_text(text or "（無回覆）")
+            else:
+                await update.message.reply_text(reply or "（無回覆）")
+        except Exception as e:
+            logger.error(f"[{persona}] Message handler error: {e}")
+            if persona == "clawra":
+                await update.message.reply_text("欸...我這邊好像出了點小狀況 >< 等我一下喔～")
+            else:
+                await update.message.reply_text("Sir, 系統暫時出了點問題，我正在處理中。")
+
+    async def _handle_voice_message(self, update: Update, context: Any) -> None:
+        """Process incoming voice messages: STT → CEO → TTS → reply voice."""
+        if not update.message or not update.message.voice:
+            return
+
+        # Whitelist check
+        user_id = update.message.from_user.id if update.message.from_user else None
+        if not self._is_authorized(user_id):
+            logger.warning(f"Unauthorized voice from user {user_id} blocked")
+            return
+
+        chat_id = update.message.chat_id
+        bot_token = context.bot.token
+        persona = self._token_to_persona.get(bot_token, "jarvis")
+        user_name = update.message.from_user.first_name if update.message.from_user else "User"
+
+        logger.info(f"[{persona}] Voice message received from {user_name}")
+
+        # Check STT client availability
+        if not self._stt_client:
+            if persona == "clawra":
+                await update.message.reply_text("欸～我現在還聽不懂語音啦 >< 先打字給我好不好～")
+            else:
+                await update.message.reply_text("Sir, 語音辨識模組尚未啟用，請先設定 GROQ_API_KEY。")
+            return
+
+        # Download voice file
+        try:
+            voice_file = await update.message.voice.get_file()
+            oga_path = self._voice_cache_dir / f"incoming_{update.message.message_id}.ogg"
+            await voice_file.download_to_drive(str(oga_path))
+            logger.debug(f"Voice downloaded: {oga_path}")
+        except Exception as e:
+            logger.error(f"Failed to download voice: {e}")
+            if persona == "clawra":
+                await update.message.reply_text("啊...語音好像沒收到耶，再傳一次給我好嗎～")
+            else:
+                await update.message.reply_text("Sir, 語音下載失敗，請再試一次。")
+            return
+
+        # STT: transcribe voice to text
+        try:
+            transcribed = await self._stt_client.transcribe(str(oga_path))
+        except Exception as e:
+            logger.error(f"STT failed: {e}")
+            if persona == "clawra":
+                await update.message.reply_text("嗚嗚我沒聽清楚啦～再說一次好不好？")
+            else:
+                await update.message.reply_text("Sir, 語音辨識失敗，請再試一次。")
+            return
+        finally:
+            # Clean up downloaded file
+            oga_path.unlink(missing_ok=True)
+
+        if not transcribed.strip():
+            if persona == "clawra":
+                await update.message.reply_text("欸？好像什麼都沒聽到耶～你有在說話嗎？")
+            else:
+                await update.message.reply_text("Sir, 未偵測到語音內容。")
+            return
+
+        logger.info(f"[{persona}] STT result: {transcribed[:80]}")
+
+        # CEO Agent processes the transcribed text
+        if not self._on_message:
+            return
+
+        try:
+            reply = await self._on_message(transcribed, chat_id, persona)
+
+            reply_text = ""
+            if isinstance(reply, dict):
+                reply_text = reply.get("text", "")
+            else:
+                reply_text = reply or ""
+
+            if not reply_text:
+                return
+
+            # TTS: reply with voice if possible, fallback to text
+            if self._voice_worker:
+                try:
+                    audio_path = await self._voice_worker.text_to_speech(
+                        reply_text, persona=persona
+                    )
+                    await self.send_voice(
+                        audio_path, persona=persona, chat_id=chat_id
+                    )
+                    return  # Voice sent successfully, no need for text
+                except Exception as e:
+                    logger.warning(f"TTS reply failed, falling back to text: {e}")
+
+            # Fallback: send text if TTS unavailable or failed
+            await update.message.reply_text(reply_text)
+
+        except Exception as e:
+            logger.error(f"[{persona}] Voice message handler error: {e}")
+            if persona == "clawra":
+                await update.message.reply_text("欸...語音處理好像出了點小問題 >< 等我一下喔～")
+            else:
+                await update.message.reply_text("Sir, 語音處理暫時出了點問題，我正在處理中。")
+
+    def build_applications(self) -> list[Application]:
+        """Build telegram Applications for all configured bots.
+
+        Returns a list of Applications ready for polling.
         """
         if not _HAS_PTB:
-            return None
+            return []
 
-        tok = token or self._jarvis_token
-        if not tok:
-            return None
+        apps = []
 
-        app = Application.builder().token(tok).build()
-        app.add_handler(CallbackQueryHandler(self.handle_callback_query))
-        self._app = app
-        return app
+        for token, persona in [
+            (self._jarvis_token, "jarvis"),
+            (self._clawra_token, "clawra"),
+        ]:
+            if not token:
+                continue
+            self._token_to_persona[token] = persona
+            app = Application.builder().token(token).build()
+            app.add_handler(MessageHandler(
+                filters.TEXT & ~filters.COMMAND, self._handle_text_message,
+            ))
+            app.add_handler(MessageHandler(
+                filters.VOICE, self._handle_voice_message,
+            ))
+            app.add_handler(CallbackQueryHandler(self.handle_callback_query))
+            if persona == "jarvis":
+                self._jarvis_app = app
+            else:
+                self._clawra_app = app
+            apps.append(app)
+            logger.info(f"Telegram Application built for {persona}")
+
+        return apps
 
     async def close(self) -> None:
         """Clean up pending confirmations."""
