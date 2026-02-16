@@ -53,6 +53,7 @@ async def main() -> None:
     logger.info("  [2/12] Security Gate initialized")
 
     # ── Step 3: Initialize API Clients ────────────────────────────
+    from clients.groq_chat_client import GroqChatClient
     from clients.nvidia_client import NvidiaClient
     from clients.openrouter_client import OpenRouterClient
     from clients.zhipu_client import ZhipuClient
@@ -76,10 +77,19 @@ async def main() -> None:
 
     openrouter = OpenRouterClient(
         api_key=os.environ.get("OPENROUTER_API_KEY", ""),
-        model=models.get("ceo", {}).get("backup", {}).get("model"),
+        model=models.get("ceo", {}).get("tertiary", {}).get("model")
+            or models.get("ceo", {}).get("backup", {}).get("model"),
     )
 
-    logger.info("  [3/12] API Clients initialized (Nvidia, Zhipu, OpenRouter)")
+    groq_chat = None
+    groq_key_chat = os.environ.get("GROQ_API_KEY", "")
+    if groq_key_chat and groq_key_chat != "gsk_your-groq-key-here":
+        groq_chat = GroqChatClient(
+            api_key=groq_key_chat,
+            model=models.get("ceo", {}).get("backup", {}).get("model", "llama-3.3-70b-versatile"),
+        )
+
+    logger.info("  [3/12] API Clients initialized (Nvidia, Zhipu, OpenRouter%s)", ", Groq" if groq_chat else "")
 
     # ── Step 4: Initialize Model Router + Failover ────────────────
     from core.model_router import ModelRouter
@@ -88,14 +98,28 @@ async def main() -> None:
         nvidia_client=nvidia,
         zhipu_client=zhipu,
         openrouter_client=openrouter,
+        groq_client=groq_chat,
         config=config,
     )
 
-    # Quick health check
+    # Quick health check — mark failed providers DOWN immediately
+    from core.model_router import ModelRole, ProviderStatus
+
     health = await router.health_check_all()
     for provider, is_healthy in health.items():
         status = "OK" if is_healthy else "UNREACHABLE"
         logger.info(f"    {provider}: {status}")
+        if not is_healthy:
+            router._provider_status[provider] = ProviderStatus.DOWN
+            # If zhipu health check fails, also mark zhipu_ceo down
+            if provider == "zhipu":
+                router._provider_status["zhipu_ceo"] = ProviderStatus.DOWN
+            logger.warning(f"    {provider} marked DOWN at startup (skip on first request)")
+
+    ceo_chain = " → ".join(
+        name for name, _ in router._get_chain_for_role(ModelRole.CEO)
+    )
+    logger.info(f"    CEO chain: {ceo_chain}")
 
     logger.info("  [4/12] Model Router initialized")
 
@@ -127,7 +151,7 @@ async def main() -> None:
     from memory.markdown_memory import MarkdownMemory
     from skills.registry import SkillRegistry
 
-    soul = Soul(config_dir="./config")
+    soul = Soul(config_dir="./config", memory_dir="./memory")
     soul.load()
 
     md_memory = MarkdownMemory("./memory")
@@ -153,7 +177,29 @@ async def main() -> None:
         security_gate=security,
         markdown_memory=md_memory,
     )
-    ceo.memory_search = memory_search
+
+    # 7c: Hybrid search (BM25 + Gemini Embedding) if GEMINI_API_KEY available
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if gemini_key:
+        from core.embedding_search import EmbeddingIndex, HybridSearch
+
+        embedding_index = EmbeddingIndex(
+            memory_dir="./memory",
+            cache_path="./data/embedding_index.json",
+            api_key=gemini_key,
+        )
+        try:
+            await embedding_index.build_index()
+            hybrid_search = HybridSearch(bm25=memory_search, embedding=embedding_index)
+            ceo.memory_search = hybrid_search
+            logger.info("  [7c/12] Hybrid search initialized (BM25 + Gemini Embedding)")
+        except Exception as e:
+            logger.warning(f"  [7c/12] Embedding init failed, using BM25 only: {e}")
+            ceo.memory_search = memory_search
+    else:
+        ceo.memory_search = memory_search
+        logger.info("  [7c/12] Gemini Embedding skipped (no GEMINI_API_KEY)")
+
     logger.info("  [7/12] CEO Agent initialized (persona: jarvis)")
 
     # ── Step 8: Initialize Workers ────────────────────────────────
@@ -171,12 +217,14 @@ async def main() -> None:
         cache_dir=voice_cache_dir,
         azure_key=os.environ.get("AZURE_SPEECH_KEY", ""),
         azure_region=os.environ.get("AZURE_SPEECH_REGION", ""),
+        zhipu_key=os.environ.get("ZHIPU_API_KEY", ""),
+        zhipu_voice=os.environ.get("ZHIPU_TTS_VOICE", "tongtong"),
     )
 
     workers = {
         "code": CodeWorker(model_router=router),
         "interpreter": InterpreterWorker(security_gate=security),
-        "browser": BrowserWorker(security_gate=security),
+        "browser": BrowserWorker(security_gate=security, model_router=router),
         "vision": VisionWorker(model_router=router),
         "selfie": SelfieWorker(skill_registry=registry),
         "voice": voice_worker,
@@ -187,6 +235,16 @@ async def main() -> None:
     workers["knowledge"] = KnowledgeWorker(
         model_router=router, memos=memos, memory_search=memory_search,
     )
+
+    # H0 v2: GogWorker (Google Workspace via gog CLI)
+    from workers.gog_worker import GogWorker
+
+    gog_worker = GogWorker(account=os.environ.get("GOG_ACCOUNT", ""))
+    if gog_worker.is_available:
+        workers["gog"] = gog_worker
+        logger.info("    gog CLI: ready")
+    else:
+        logger.warning("    gog CLI: not available (Calendar/Gmail via gog disabled)")
 
     ceo.workers = workers
     logger.info(f"  [8/12] Workers initialized ({len(workers)} workers)")
@@ -206,6 +264,28 @@ async def main() -> None:
     pending_mgr.load()
     ceo.pending = pending_mgr
     logger.info("  [8c/12] ReactExecutor + PendingTasks initialized")
+
+    # I5: SessionManager + LoginAssistant
+    from core.session_manager import SessionManager
+    from core.login_assistant import LoginAssistant
+
+    session_mgr = SessionManager("./data/session_status.json")
+    login_assistant = LoginAssistant(session_manager=session_mgr)
+    ceo._session_mgr = session_mgr
+    ceo._login_assistant = login_assistant
+    logger.info("  [8d/12] Patch I modules initialized (TaskRouter, Compressor, SessionManager)")
+
+    # Patch J: Soul evolution
+    from core.soul_growth import SoulGrowth
+    from core.shared_memory import SharedMemory
+    from core.soul_guard import SoulGuard
+
+    soul_growth = SoulGrowth(memory_dir="./memory")
+    shared_memory = SharedMemory(memory_dir="./memory")
+    soul_guard = SoulGuard(config_dir="./config", memory_dir="./memory")
+    ceo._soul_growth = soul_growth
+    ceo._shared_memory = shared_memory
+    logger.info("  [8e/12] Patch J modules initialized (SoulGrowth, SharedMemory, SoulGuard)")
 
     # Inject voice worker into Telegram client
     telegram.voice_worker = voice_worker
@@ -265,9 +345,15 @@ async def main() -> None:
     logger.info("  [9/12] Heartbeat Scheduler started")
 
     # ── Step 10: Telegram polling ─────────────────────────────────
-    async def on_telegram_message(user_text: str, chat_id: int, persona: str = "jarvis") -> str:
+    async def on_telegram_message(user_text: str, chat_id: int, persona: str = "jarvis") -> dict | str:
         """Handle incoming Telegram messages via CEO Agent."""
-        return await ceo.handle_message(user_text, persona=persona)
+        result = await ceo.handle_message(user_text, persona=persona)
+        emotion = getattr(ceo, "_last_emotion", None)
+        if isinstance(result, str):
+            return {"text": result, "emotion": emotion}
+        if isinstance(result, dict):
+            result.setdefault("emotion", emotion)
+        return result
 
     telegram.set_message_handler(on_telegram_message)
     tg_apps = telegram.build_applications()
@@ -308,11 +394,11 @@ async def main() -> None:
             await tg_app.shutdown()
         await telegram.close()
         await memos.close()
-        await router.close()
+        await router.close()  # also closes groq if present
         if fal_client:
             await fal_client.close()
         await voice_worker.close()
-        await workers["browser"].close()
+        await workers["browser"].close()  # also calls close_playwright()
         logger.info("J.A.R.V.I.S. offline. Good night, Sir.")
 
 

@@ -12,6 +12,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from typing import Any
@@ -21,16 +22,68 @@ from loguru import logger
 
 from clients.base_client import ChatMessage, ChatResponse
 from core.model_router import ModelRole, ModelRouter, RouterError
+from core.conversation_compressor import ConversationCompressor
+from core.help_decision import HelpDecisionEngine
 from core.react_executor import ReactExecutor, FuseState, TaskResult
 from core.security_gate import OperationType, OperationVerdict
+from core.shared_memory import SharedMemory
+from core.soul_growth import SoulGrowth
+from core.task_router import TaskRouter
 
 # Pattern for LLM tool calls in response text (fallback)
-_TOOL_PATTERN = re.compile(r'\[(?:FETCH|SEARCH):([^\]]+)\]')
+_TOOL_PATTERN = re.compile(r'\[(?:FETCH|SEARCH|MAPS):([^\]]+)\]')
+
+# ── H1 v2: Task Resolution Chains ────────────────────────────────
+# CLI/API first → httpx → browser (last resort) → partial assist
+# Each chain entry: {"method": str, "worker": str, "timeout": int}
+TASK_RESOLUTION_CHAINS: dict[str, dict] = {
+    # ── Calendar / Email — gog CLI handles it ──
+    "calendar": {
+        "chain": [
+            {"method": "gog_cli", "worker": "gog", "timeout": 15},
+        ],
+    },
+    "email": {
+        "chain": [
+            {"method": "gog_cli", "worker": "gog", "timeout": 15},
+        ],
+    },
+    # ── Booking — API first, browser last ──
+    "booking": {
+        "chain": [
+            {"method": "httpx_search", "worker": "browser", "timeout": 15},
+            {"method": "browser", "worker": "browser", "timeout": 45},
+            {"method": "partial_assist", "worker": "knowledge", "timeout": 30},
+        ],
+    },
+    # ── Web search — httpx → browser → knowledge ──
+    "web_search": {
+        "chain": [
+            {"method": "httpx_search", "worker": "browser", "timeout": 15},
+            {"method": "browser_search", "worker": "browser", "timeout": 30},
+            {"method": "knowledge_reply", "worker": "knowledge", "timeout": 30},
+        ],
+    },
+    # ── Code ──
+    "code_task": {
+        "chain": [
+            {"method": "direct", "worker": "code", "timeout": 60},
+            {"method": "knowledge_reply", "worker": "knowledge", "timeout": 30},
+        ],
+    },
+    # ── General fallback ──
+    "general": {
+        "chain": [
+            {"method": "knowledge_reply", "worker": "knowledge", "timeout": 30},
+        ],
+    },
+}
 
 # ── Proactive web search detection ──────────────────────────────
 # Patterns that indicate user needs web information
 _WEB_NEED_PATTERNS = re.compile(
     r"幫我查|幫我搜|幫我找|查一下|搜一下|搜尋|搜索|查詢|"
+    r"幫我訂|訂位|預約|預定|booking|reserve|"
     r"上網.*?(?:查|看|搜|找)|連外網|連網路|"
     r"(?:今天|今日|現在|目前|最新|最近).*?(?:天氣|新聞|消息|行情|價格|報導)|"
     r"(?:天氣|新聞|行情).*?(?:怎[麼樣]|如何|多少|什麼)|"
@@ -98,6 +151,13 @@ class CEOAgent:
         # G2: Memory flush tracking
         self._turn_count = 0
         self._flush_threshold = 20  # flush every 20 turns
+        # Patch I: multi-task modules
+        self._compressor = ConversationCompressor()
+        self._task_router = TaskRouter()
+        self._help_engine = HelpDecisionEngine()
+        # Patch J: soul evolution
+        self._soul_growth: SoulGrowth | None = None
+        self._shared_memory: SharedMemory | None = None
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -160,6 +220,9 @@ class CEOAgent:
         was_silent: bool,
     ) -> str | dict[str, Any]:
         """Core message processing (extracted for silent mode error handling)."""
+        # I3: Track conversation in compressor
+        self._compressor.add_turn("user", user_message)
+
         # 1. Emotion detection
         emotion_label = "normal"
         if self.emotion:
@@ -187,11 +250,15 @@ class CEOAgent:
             await self._save_session_transcript(active_persona)
         self._last_message_time = now
 
-        # 2c. Memory search — inject relevant context
+        # 2c. Memory search — inject relevant context (supports async HybridSearch)
         extra_ctx = dict(context) if context else {}
         if self.memory_search:
             try:
-                results = self.memory_search.search(user_message, top_k=3)
+                search_fn = getattr(self.memory_search, "search", None)
+                if asyncio.iscoroutinefunction(search_fn):
+                    results = await self.memory_search.search(user_message, top_k=3)
+                else:
+                    results = self.memory_search.search(user_message, top_k=3)
                 if results:
                     mem_ctx = "\n".join(r["text"][:200] for r in results)
                     extra_ctx["相關記憶"] = mem_ctx
@@ -200,8 +267,15 @@ class CEOAgent:
 
         # 2d. Proactive web search — detect need and fetch BEFORE LLM responds
         web_results = await self._proactive_web_search(user_message)
+        _booking_phone = None
+        _booking_url = None
         if web_results:
-            extra_ctx["網路搜尋結果"] = web_results
+            if isinstance(web_results, dict):
+                extra_ctx["網路搜尋結果"] = web_results["text"]
+                _booking_phone = web_results.get("phone")
+                _booking_url = web_results.get("booking_url")
+            else:
+                extra_ctx["網路搜尋結果"] = web_results
 
         # 3. Build system prompt (with skill failure context if applicable)
         if self._last_skill_failure:
@@ -224,11 +298,12 @@ class CEOAgent:
         )
         reply = response.content
 
-        # 5b. Reactive fallback: if LLM outputs [FETCH:]/[SEARCH:], execute
+        # 5b. Reactive fallback: if LLM outputs [FETCH:]/[SEARCH:]/[MAPS:], execute
         tool_match = _TOOL_PATTERN.search(reply)
         if tool_match:
+            tag = tool_match.group(0).split(":")[0].lstrip("[")
             query_or_url = tool_match.group(1).strip()
-            tool_result = await self._execute_tool_call(query_or_url)
+            tool_result = await self._execute_tool_call(query_or_url, tag=tag)
             if tool_result:
                 messages.append(ChatMessage(role="assistant", content=reply))
                 messages.append(ChatMessage(
@@ -246,6 +321,37 @@ class CEOAgent:
 
         # 6. Store to MemOS
         await self._store_conversation(user_message, reply, session_id)
+
+        # Expose last emotion for voice TTS emotion passthrough
+        self._last_emotion = emotion_label
+
+        # I3: Track assistant reply in compressor
+        self._compressor.add_turn("assistant", reply if isinstance(reply, str) else str(reply))
+
+        # J2+J3: Soul growth — learn from conversation
+        reply_str = reply if isinstance(reply, str) else str(reply)
+        if self._soul_growth:
+            try:
+                insight = self._soul_growth.maybe_learn(active_persona, user_message, reply_str)
+                if insight and self.soul:
+                    self.soul.reload_growth(active_persona)
+            except Exception as e:
+                logger.debug(f"Soul growth failed: {e}")
+
+        # J4: Shared memory — check for memorable moments (Clawra only)
+        if active_persona == "clawra" and self._shared_memory:
+            try:
+                self._shared_memory.check_and_remember(user_message, reply_str)
+            except Exception as e:
+                logger.debug(f"Shared memory failed: {e}")
+
+        # K3: Booking result — attach phone/booking_url for Telegram
+        if _booking_phone or _booking_url:
+            return {
+                "text": reply if isinstance(reply, str) else str(reply),
+                "phone": _booking_phone,
+                "booking_url": _booking_url,
+            }
 
         return reply
 
@@ -420,8 +526,30 @@ class CEOAgent:
 
     # ── Tool Execution ────────────────────────────────────────
 
-    async def _execute_tool_call(self, query_or_url: str) -> str | None:
-        """Execute a [FETCH:url] or [SEARCH:query] tool call from LLM output."""
+    async def _execute_tool_call(self, query_or_url: str, *, tag: str = "") -> str | None:
+        """Execute a [FETCH:url], [SEARCH:query], or [MAPS:query] tool call from LLM output."""
+        # MAPS tag → Google Maps search
+        if tag == "MAPS":
+            browser = self.workers.get("browser")
+            if browser and hasattr(browser, "search_google_maps"):
+                logger.info(f"CEO tool-use: MAPS {query_or_url[:60]}")
+                result = await browser.search_google_maps(query_or_url)
+                if result.get("error"):
+                    return f"Google Maps 搜尋失敗: {result['error']}"
+                parts = []
+                if result.get("name"):
+                    parts.append(f"店名: {result['name']}")
+                if result.get("phone"):
+                    parts.append(f"電話: {result['phone']}")
+                if result.get("address"):
+                    parts.append(f"地址: {result['address']}")
+                if result.get("rating"):
+                    parts.append(f"評分: {result['rating']}")
+                if result.get("booking_url"):
+                    parts.append(f"訂位連結: {result['booking_url']}")
+                return "\n".join(parts) if parts else "找不到相關店家資訊"
+            return None
+
         # Use ReactExecutor if available
         if self.react_executor:
             try:
@@ -473,7 +601,7 @@ class CEOAgent:
 
     # ── Proactive Web Search ─────────────────────────────────────
 
-    async def _proactive_web_search(self, user_message: str) -> str | None:
+    async def _proactive_web_search(self, user_message: str) -> str | dict | None:
         """Detect if user needs web info and fetch it BEFORE LLM responds.
 
         This is proactive — the system detects the need automatically,
@@ -482,13 +610,82 @@ class CEOAgent:
         Uses ReactExecutor for automatic fallback when available.
 
         Returns:
-            Truncated search result text, or None if no web search needed.
+            str — search result text
+            dict — booking result with phone/booking_url for Telegram
+            None — no web search needed
         """
         # Need either browser or react_executor
         has_browser = self.workers.get("browser") and hasattr(self.workers["browser"], "fetch_url")
         has_react = self.react_executor is not None
         if not has_browser and not has_react:
             return None
+
+        # Booking intent → Google Maps search → try complete booking
+        if re.search(r'訂位|預約|幫我訂|預定|幫我.*訂', user_message):
+            browser = self.workers.get("browser")
+            if browser and hasattr(browser, "search_google_maps"):
+                restaurant = re.sub(
+                    r'幫我訂|訂位|預約|預定|明天|今天|後天|晚上|中午|早上|下午'
+                    r'|\d+點|\d+個人|\d+位',
+                    '', user_message,
+                ).strip()
+                if restaurant:
+                    logger.info(f"Proactive booking search: {restaurant}")
+                    result = await browser.search_google_maps(restaurant)
+                    if not result.get("error"):
+                        # Extract booking details from user message
+                        booking_details = self._parse_booking_details(user_message)
+
+                        # If Maps didn't find booking_url, search web for it
+                        if not result.get("booking_url") and hasattr(browser, "find_booking_url"):
+                            name_for_search = result.get("name") or restaurant
+                            logger.info(f"No booking URL from Maps, searching web for: {name_for_search}")
+                            found_url = await browser.find_booking_url(name_for_search)
+                            if found_url:
+                                result["booking_url"] = found_url
+
+                        # Try to complete booking if browser supports it
+                        if hasattr(browser, "complete_booking") and (
+                            result.get("booking_url") or result.get("website")
+                        ):
+                            logger.info(f"Attempting auto-booking for {result.get('name')}")
+                            booking_result = await browser.complete_booking(
+                                restaurant_info=result,
+                                booking_details=booking_details,
+                            )
+                            if booking_result.get("status") == "booked":
+                                return {
+                                    "text": (
+                                        f"訂位完成！\n"
+                                        f"店名: {result.get('name')}\n"
+                                        f"{booking_result.get('result', '')}"
+                                    ),
+                                    "phone": result.get("phone"),
+                                    "booking_url": None,
+                                }
+                            # CAPTCHA/verification fallback → give user the URL
+                            if booking_result.get("captcha"):
+                                logger.info("Booking blocked by CAPTCHA, returning URL to user")
+                                result["booking_url"] = booking_result.get("booking_url") or result.get("booking_url")
+
+                        # Fallback: return info for user
+                        parts = []
+                        if result.get("name"):
+                            parts.append(f"店名: {result['name']}")
+                        if result.get("phone"):
+                            parts.append(f"電話: {result['phone']}")
+                        if result.get("address"):
+                            parts.append(f"地址: {result['address']}")
+                        if result.get("rating"):
+                            parts.append(f"評分: {result['rating']}")
+                        if result.get("booking_url"):
+                            parts.append(f"訂位連結: {result['booking_url']}")
+                        if parts:
+                            return {
+                                "text": "\n".join(parts),
+                                "phone": result.get("phone"),
+                                "booking_url": result.get("booking_url"),
+                            }
 
         # Check for URL in message → direct fetch
         url_match = _URL_IN_MSG.search(user_message)
@@ -553,6 +750,41 @@ class CEOAgent:
 
     # ── Internal ────────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_booking_details(msg: str) -> dict[str, str]:
+        """Extract date/time/people from user booking message."""
+        import datetime as _dt
+        details: dict[str, str] = {"name": "Ted"}
+
+        # Date
+        today = _dt.date.today()
+        if "後天" in msg:
+            details["date"] = str(today + _dt.timedelta(days=2))
+        elif "明天" in msg:
+            details["date"] = str(today + _dt.timedelta(days=1))
+        elif "今天" in msg:
+            details["date"] = str(today)
+        else:
+            details["date"] = str(today + _dt.timedelta(days=1))  # default: 明天
+
+        # Time
+        time_match = re.search(r'(\d{1,2})[:\s]*(\d{2})?(?:\s*[~\-到]\s*(\d{1,2})[:\s]*(\d{2})?)?(?:\s*點)?', msg)
+        if time_match:
+            h = time_match.group(1)
+            m = time_match.group(2) or "00"
+            details["time"] = f"{int(h):02d}:{m}"
+        elif "晚上" in msg:
+            details["time"] = "18:30"
+        elif "中午" in msg:
+            details["time"] = "12:00"
+
+        # People count
+        people_match = re.search(r'(\d+)\s*(?:個人|人|位)', msg)
+        if people_match:
+            details["people"] = people_match.group(1)
+
+        return details
+
     _TOOL_INSTRUCTIONS = (
         "\n\n## 網路能力\n"
         "你擁有連接外部網路的能力。"
@@ -561,6 +793,7 @@ class CEOAgent:
         "如果需要進一步查詢，可以在回覆中使用：\n"
         "- `[FETCH:完整網址]` — 讀取某個網頁\n"
         "- `[SEARCH:搜尋關鍵字]` — 搜尋更多資訊\n"
+        "- `[MAPS:店名或地址]` — Google Maps 搜尋，取得電話、地址、訂位連結\n"
         "絕對不要說「我無法上網」或「我沒有網路存取能力」，因為你確實有。"
     )
 
@@ -579,6 +812,15 @@ class CEOAgent:
         if context:
             for k, v in context.items():
                 extra_parts.append(f"{k}: {v}")
+
+        # J4: Inject shared memory context for Clawra
+        if persona == "clawra" and self._shared_memory:
+            try:
+                moments_ctx = self._shared_memory.get_context_for_prompt()
+                if moments_ctx:
+                    extra_parts.append(f"共同記憶: {moments_ctx}")
+            except Exception:
+                pass
 
         extra = "\n".join(extra_parts)
 

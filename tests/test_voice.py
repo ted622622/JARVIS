@@ -516,7 +516,7 @@ class TestTelegramVoiceHandler:
 
         # TTS was generated and voice was sent
         mock_voice.text_to_speech.assert_called_once_with(
-            "你好！有什麼我能幫你的嗎？", persona="jarvis",
+            "你好！有什麼我能幫你的嗎？", persona="jarvis", emotion=None,
         )
         mock_bot.send_voice.assert_called_once()
 
@@ -795,6 +795,216 @@ class TestBrowserWorkerFetch:
 
         await worker.close()
         mock_client.aclose.assert_called_once()
+
+
+# ── GLM-TTS (Zhipu) ─────────────────────────────────────────────
+
+
+class TestZhipuTTS:
+    @pytest.mark.asyncio
+    async def test_zhipu_tts_success(self, tmp_path):
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            zhipu_key="test-key",
+        )
+        out_path = tmp_path / "test.mp3"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"\xff\xfb\x90\x00" * 100
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        mock_client.is_closed = False
+        worker._http_client = mock_client
+
+        result = await worker._zhipu_tts("測試語音", "jarvis", out_path)
+        assert result is True
+        assert out_path.exists()
+        assert out_path.stat().st_size > 0
+
+        call_kwargs = mock_client.post.call_args
+        assert "bigmodel.cn" in call_kwargs[0][0]
+        body = call_kwargs[1]["json"]
+        assert body["model"] == "glm-tts"
+        assert body["input"] == "測試語音"
+        assert body["voice"] == "tongtong"
+
+    @pytest.mark.asyncio
+    async def test_zhipu_tts_no_key_skips(self, tmp_path):
+        worker = VoiceWorker(cache_dir=str(tmp_path))
+        out_path = tmp_path / "test.mp3"
+        result = await worker._zhipu_tts("test", "jarvis", out_path)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_zhipu_tts_api_error(self, tmp_path):
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            zhipu_key="bad-key",
+        )
+        out_path = tmp_path / "test.mp3"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        mock_client.is_closed = False
+        worker._http_client = mock_client
+
+        result = await worker._zhipu_tts("test", "jarvis", out_path)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_zhipu_tts_network_error(self, tmp_path):
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            zhipu_key="key",
+        )
+        out_path = tmp_path / "test.mp3"
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = Exception("connection refused")
+        mock_client.is_closed = False
+        worker._http_client = mock_client
+
+        result = await worker._zhipu_tts("test", "jarvis", out_path)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_zhipu_tts_empty_response(self, tmp_path):
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            zhipu_key="test-key",
+        )
+        out_path = tmp_path / "test.mp3"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b""
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        mock_client.is_closed = False
+        worker._http_client = mock_client
+
+        result = await worker._zhipu_tts("test", "jarvis", out_path)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_zhipu_failure_azure_fallback(self, tmp_path):
+        """GLM-TTS fails → falls back to Azure."""
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            azure_key="azure-key",
+            azure_region="eastasia",
+            zhipu_key="zhipu-key",
+        )
+
+        # GLM-TTS fails
+        zhipu_resp = MagicMock()
+        zhipu_resp.status_code = 500
+
+        # Azure succeeds
+        azure_resp = MagicMock()
+        azure_resp.status_code = 200
+        azure_resp.content = b"\xff\xfb\x90\x00" * 100
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = [zhipu_resp, azure_resp]
+        mock_client.is_closed = False
+        worker._http_client = mock_client
+
+        path = await worker.text_to_speech("Hello", persona="jarvis")
+        assert Path(path).exists()
+        assert mock_client.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_zhipu_azure_fail_edge_fallback(self, tmp_path):
+        """GLM-TTS + Azure both fail → falls back to edge-tts."""
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            azure_key="azure-key",
+            azure_region="eastasia",
+            zhipu_key="zhipu-key",
+        )
+
+        # Both HTTP calls fail
+        fail_resp = MagicMock()
+        fail_resp.status_code = 500
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = fail_resp
+        mock_client.is_closed = False
+        worker._http_client = mock_client
+
+        mock_communicate = AsyncMock()
+
+        async def fake_save(path):
+            Path(path).write_bytes(b"\xff\xfb\x90\x00" * 100)
+
+        mock_communicate.save = fake_save
+
+        with patch("workers.voice_worker.edge_tts") as mock_edge:
+            mock_edge.Communicate.return_value = mock_communicate
+            path = await worker.text_to_speech("test", persona="jarvis")
+
+        assert Path(path).exists()
+
+    @pytest.mark.asyncio
+    async def test_zhipu_custom_voice(self, tmp_path):
+        """Custom zhipu_voice parameter is used in API call."""
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            zhipu_key="test-key",
+            zhipu_voice="custom_voice",
+        )
+        out_path = tmp_path / "test.mp3"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"\xff\xfb\x90\x00" * 100
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        mock_client.is_closed = False
+        worker._http_client = mock_client
+
+        await worker._zhipu_tts("test", "jarvis", out_path)
+
+        body = mock_client.post.call_args[1]["json"]
+        assert body["voice"] == "custom_voice"
+
+
+class TestTTSFallbackChain:
+    @pytest.mark.asyncio
+    async def test_cache_key_unaffected_by_emotion(self, tmp_path):
+        """Cache key should only depend on text+persona, not emotion."""
+        worker = VoiceWorker(cache_dir=str(tmp_path))
+        p1 = worker._cache_path("same text", "jarvis")
+        p2 = worker._cache_path("same text", "jarvis")
+        assert p1 == p2
+
+    @pytest.mark.asyncio
+    async def test_execute_passes_emotion(self, tmp_path):
+        """execute() should forward emotion kwarg to text_to_speech."""
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            zhipu_key="test-key",
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"\xff\xfb\x90\x00" * 100
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        mock_client.is_closed = False
+        worker._http_client = mock_client
+
+        result = await worker.execute("Say hello", persona="jarvis", emotion="happy")
+        assert "audio_path" in result
 
 
 # ── VoiceTextCleaner ─────────────────────────────────────────

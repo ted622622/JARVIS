@@ -4,6 +4,9 @@
 httpx>=0.27.0
 aiohttp>=3.9.0
 
+# Browser Automation (optional — graceful degradation if not installed)
+playwright>=1.49.0
+
 # API SDKs
 zhipuai>=2.1.0
 sniffio>=1.3.0  # implicit dep of zhipuai on Python 3.14
@@ -22,6 +25,8 @@ edge-tts>=6.1.0
 
 # Search
 rank_bm25>=0.2.2
+google-genai>=1.0.0  # Gemini Embedding async API
+numpy>=1.26.0  # cosine similarity + vector storage
 
 # Database
 aiosqlite>=0.20.0

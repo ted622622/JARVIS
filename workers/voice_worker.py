@@ -1,7 +1,8 @@
 """Voice Worker — TTS for J.A.R.V.I.S. and Clawra.
 
-Primary: Azure Speech (SSML, natural prosody)
-Fallback: edge-tts (free, if Azure key unavailable)
+Primary: 智譜 GLM-TTS (context-aware emotion, GRPO-optimized)
+Fallback 1: Azure Speech (SSML, natural prosody)
+Fallback 2: edge-tts (free, unlimited)
 
 Each persona has a distinct voice, speaking rate, and style.
 """
@@ -48,22 +49,30 @@ AZURE_OUTPUT_FORMAT = "audio-16khz-128kbitrate-mono-mp3"
 class VoiceWorker:
     """Worker for text-to-speech generation.
 
+    Three-tier fallback: GLM-TTS → Azure Speech → edge-tts.
+
     Usage:
         worker = VoiceWorker(azure_key="xxx", azure_region="eastasia")
         path = await worker.text_to_speech("Hello!", persona="jarvis")
     """
+
+    ZHIPU_TTS_URL = "https://open.bigmodel.cn/api/paas/v4/audio/speech"
 
     def __init__(
         self,
         cache_dir: str = DEFAULT_CACHE_DIR,
         azure_key: str = "",
         azure_region: str = "",
+        zhipu_key: str = "",
+        zhipu_voice: str = "tongtong",
     ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.name = "voice"
         self.azure_key = azure_key
         self.azure_region = azure_region
+        self.zhipu_key = zhipu_key
+        self.zhipu_voice = zhipu_voice
         self._http_client: httpx.AsyncClient | None = None
 
     async def _get_http_client(self) -> httpx.AsyncClient:
@@ -107,6 +116,43 @@ class VoiceWorker:
             "</mstts:express-as>"
             "</voice></speak>"
         )
+
+    async def _zhipu_tts(self, text: str, persona: str, out_path: Path) -> bool:
+        """Generate speech via Zhipu GLM-TTS REST API. Returns True on success."""
+        if not self.zhipu_key:
+            return False
+
+        client = await self._get_http_client()
+        body: dict[str, Any] = {
+            "model": "glm-tts",
+            "input": text,
+            "voice": self.zhipu_voice,
+            "response_format": "mp3",
+        }
+
+        try:
+            resp = await client.post(
+                self.ZHIPU_TTS_URL,
+                json=body,
+                headers={"Authorization": f"Bearer {self.zhipu_key}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"GLM-TTS failed ({resp.status_code})")
+                return False
+
+            out_path.write_bytes(resp.content)
+            size = out_path.stat().st_size
+            if size == 0:
+                out_path.unlink(missing_ok=True)
+                return False
+
+            logger.info(f"GLM-TTS: {out_path.name} ({size} bytes)")
+            return True
+
+        except Exception as e:
+            logger.warning(f"GLM-TTS error: {e}")
+            out_path.unlink(missing_ok=True)
+            return False
 
     async def _azure_tts(self, text: str, persona: str, out_path: Path) -> bool:
         """Generate speech via Azure Speech REST API. Returns True on success."""
@@ -187,14 +233,16 @@ class VoiceWorker:
         self,
         text: str,
         persona: str = "jarvis",
+        emotion: str | None = None,
     ) -> str:
         """Generate MP3 audio from text.
 
-        Tries Azure Speech first, falls back to edge-tts.
+        Three-tier fallback: GLM-TTS → Azure Speech → edge-tts.
 
         Args:
             text: Text to synthesize
             persona: "jarvis" or "clawra" (determines voice)
+            emotion: CEO emotion label (reserved for future use)
 
         Returns:
             Path to the generated MP3 file
@@ -215,11 +263,13 @@ class VoiceWorker:
             logger.debug(f"TTS cache hit: {out_path.name}")
             return str(out_path)
 
-        # Try Azure Speech first
+        # Three-tier fallback: GLM-TTS → Azure → edge-tts
+        if await self._zhipu_tts(text, persona, out_path):
+            return str(out_path)
+
         if await self._azure_tts(text, persona, out_path):
             return str(out_path)
 
-        # Fallback to edge-tts
         if await self._edge_tts(text, persona, out_path):
             return str(out_path)
 
@@ -228,8 +278,9 @@ class VoiceWorker:
     async def execute(self, task: str, **kwargs: Any) -> dict[str, Any]:
         """CEO-compatible execute interface."""
         persona = kwargs.get("persona", "jarvis")
+        emotion = kwargs.get("emotion")
         try:
-            path = await self.text_to_speech(task, persona=persona)
+            path = await self.text_to_speech(task, persona=persona, emotion=emotion)
             return {"worker": self.name, "audio_path": path}
         except Exception as e:
             logger.error(f"VoiceWorker failed: {e}")

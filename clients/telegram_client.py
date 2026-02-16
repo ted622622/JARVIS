@@ -371,9 +371,11 @@ class TelegramClient:
                 await self._simulate_typing(context.bot, chat_id, reply_text)
 
             if isinstance(reply, dict):
-                # Rich reply — may include photo
+                # Rich reply — may include photo, phone, booking_url
                 photo_url = reply.get("photo_url")
                 text = reply.get("text", "")
+                phone = reply.get("phone")
+                booking_url = reply.get("booking_url")
                 if photo_url:
                     try:
                         await update.message.reply_photo(photo=photo_url, caption=text or None)
@@ -382,6 +384,11 @@ class TelegramClient:
                         await update.message.reply_text(text or "（無回覆）")
                 else:
                     await update.message.reply_text(text or "（無回覆）")
+                # K3: Send phone number as separate message (TG auto-detects clickable phone)
+                if phone:
+                    await self.send(phone, persona=persona, chat_id=chat_id)
+                if booking_url:
+                    await self.send(booking_url, persona=persona, chat_id=chat_id)
             else:
                 await update.message.reply_text(reply or "（無回覆）")
         except Exception as e:
@@ -462,8 +469,14 @@ class TelegramClient:
             reply = await self._on_message(transcribed, chat_id, persona)
 
             reply_text = ""
+            emotion = None
+            phone = None
+            booking_url = None
             if isinstance(reply, dict):
                 reply_text = reply.get("text", "")
+                emotion = reply.get("emotion")
+                phone = reply.get("phone")
+                booking_url = reply.get("booking_url")
             else:
                 reply_text = reply or ""
 
@@ -474,17 +487,23 @@ class TelegramClient:
             if self._voice_worker:
                 try:
                     audio_path = await self._voice_worker.text_to_speech(
-                        reply_text, persona=persona
+                        reply_text, persona=persona, emotion=emotion,
                     )
                     await self.send_voice(
                         audio_path, persona=persona, chat_id=chat_id
                     )
-                    return  # Voice sent successfully, no need for text
                 except Exception as e:
                     logger.warning(f"TTS reply failed, falling back to text: {e}")
+                    await update.message.reply_text(reply_text)
+            else:
+                # Fallback: send text if TTS unavailable or failed
+                await update.message.reply_text(reply_text)
 
-            # Fallback: send text if TTS unavailable or failed
-            await update.message.reply_text(reply_text)
+            # K3: Send phone/booking_url as separate clickable messages
+            if phone:
+                await self.send(phone, persona=persona, chat_id=chat_id)
+            if booking_url:
+                await self.send(booking_url, persona=persona, chat_id=chat_id)
 
         except Exception as e:
             logger.error(f"[{persona}] Voice message handler error: {e}")

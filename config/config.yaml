@@ -8,11 +8,14 @@ identity:
 models:
   ceo:
     primary:
-      provider: "nvidia"
-      model: "moonshotai/kimi-k2.5-instruct"
-      context_window: 262144  # 256K
-      rpm_limit: 40
+      provider: "zhipu"
+      model: "glm-4.5-air"
+      context_window: 131072  # 128K
     backup:
+      provider: "groq"
+      model: "llama-3.3-70b-versatile"
+      context_window: 131072  # 128K
+    tertiary:
       provider: "openrouter"
       model: "deepseek/deepseek-chat"
       context_window: 65536   # 64K
@@ -85,14 +88,26 @@ backup:
   destination: "./backups/"
   encrypt: true
 
+embedding:
+  model: "gemini-embedding-001"
+  dimension: 768
+  cache_path: "./data/embedding_index.json"
+  bm25_weight: 0.3
+  embed_weight: 0.7
+
 voice:
   tts:
+    primary: "zhipu"  # zhipu | azure
     voice_map:
       clawra: "zh-TW-HsiaoChenNeural"
       jarvis: "zh-TW-YunJheNeural"
     rate_map:
       clawra: "+0%"
       jarvis: "+10%"
+  zhipu:
+    model: "glm-tts"
+    voice: "tongtong"
+    format: "mp3"
   stt:
     model: "whisper-large-v3-turbo"
     default_language: "zh"

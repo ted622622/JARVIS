@@ -3,6 +3,7 @@
 from .base_client import ChatMessage, ChatResponse
 from .fal_client import FalClient, FalGenerationError, FalImageResponse
 from .google_calendar import CalendarEvent, Conflict, GoogleCalendarClient
+from .groq_chat_client import GroqChatClient
 from .nvidia_client import NvidiaClient, RateLimitExceeded
 from .openrouter_client import OpenRouterClient
 from .telegram_client import TelegramClient
@@ -17,6 +18,7 @@ __all__ = [
     "FalGenerationError",
     "FalImageResponse",
     "GoogleCalendarClient",
+    "GroqChatClient",
     "ImageResponse",
     "NvidiaClient",
     "OpenRouterClient",

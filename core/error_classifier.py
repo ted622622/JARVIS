@@ -20,6 +20,7 @@ class ErrorType(str, Enum):
     ELEMENT_NOT_FOUND = "element_not_found"
     PROVIDER_DOWN = "provider_down"
     SECURITY_BLOCKED = "security_blocked"
+    DEPENDENCY_MISSING = "dependency_missing"
     UNKNOWN = "unknown"
 
 
@@ -108,6 +109,33 @@ _PATTERNS: list[tuple[re.Pattern[str], ErrorStrategy]] = [
             retry=False, max_retries=0, delay_seconds=0.0,
             fallback_worker=None,
             user_message_zh="操作被安全閘門攔截",
+        ),
+    ),
+    (
+        re.compile(r"playwright.*timeout|page\.goto.*timeout", re.IGNORECASE),
+        ErrorStrategy(
+            error_type=ErrorType.TIMEOUT,
+            retry=True, max_retries=1, delay_seconds=5.0,
+            fallback_worker="knowledge",
+            user_message_zh="瀏覽器操作逾時，正在重試",
+        ),
+    ),
+    (
+        re.compile(r"playwright.*not installed|playwright.*missing", re.IGNORECASE),
+        ErrorStrategy(
+            error_type=ErrorType.DEPENDENCY_MISSING,
+            retry=False, max_retries=0, delay_seconds=0.0,
+            fallback_worker="knowledge",
+            user_message_zh="瀏覽器自動化元件未安裝，改用其他方式",
+        ),
+    ),
+    (
+        re.compile(r"selector.*not found|waiting for selector", re.IGNORECASE),
+        ErrorStrategy(
+            error_type=ErrorType.ELEMENT_NOT_FOUND,
+            retry=False, max_retries=0, delay_seconds=0.0,
+            fallback_worker="knowledge",
+            user_message_zh="找不到頁面元素，改用其他方式",
         ),
     ),
 ]

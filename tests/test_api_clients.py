@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 
 from clients.base_client import ChatMessage, ChatResponse, RateLimitTracker, TokenBucket
+from clients.groq_chat_client import GroqChatClient
 from clients.nvidia_client import NvidiaClient, RateLimitExceeded
 from clients.openrouter_client import OpenRouterClient
 from clients.zhipu_client import ZhipuClient
@@ -152,47 +153,73 @@ class TestOpenRouterClient:
 
 
 class TestModelRouter:
-    def _make_router(self) -> ModelRouter:
+    def _make_router(self, with_groq=True) -> ModelRouter:
         nvidia = MagicMock(spec=NvidiaClient)
         zhipu = MagicMock(spec=ZhipuClient)
         openrouter = MagicMock(spec=OpenRouterClient)
-        return ModelRouter(nvidia, zhipu, openrouter, config={})
+        groq = MagicMock(spec=GroqChatClient) if with_groq else None
+        return ModelRouter(nvidia, zhipu, openrouter, groq_client=groq, config={})
 
     @pytest.mark.asyncio
-    async def test_routes_ceo_to_nvidia(self):
+    async def test_routes_ceo_to_zhipu(self):
+        """CEO chain primary is zhipu (glm-4.5-air)."""
         router = self._make_router()
-        expected = ChatResponse(content="response", model="kimi")
-        router.nvidia.chat = AsyncMock(return_value=expected)
+        expected = ChatResponse(content="response", model="glm-4.5-air")
+        router.zhipu.chat = AsyncMock(return_value=expected)
 
         result = await router.chat(
             [ChatMessage(role="user", content="test")],
             role=ModelRole.CEO,
         )
         assert result.content == "response"
-        router.nvidia.chat.assert_awaited_once()
+        router.zhipu.chat.assert_awaited_once()
+        # model override should include glm-4.5-air
+        call_kwargs = router.zhipu.chat.call_args
+        assert call_kwargs[1].get("model") == "glm-4.5-air" or \
+               (len(call_kwargs) > 1 and call_kwargs[1].get("model") == "glm-4.5-air")
 
     @pytest.mark.asyncio
-    async def test_failover_to_openrouter(self):
+    async def test_ceo_zhipu_down_falls_to_groq(self):
+        """When zhipu_ceo fails, should fallover to groq."""
         router = self._make_router()
-        router.nvidia.chat = AsyncMock(side_effect=Exception("connection refused"))
-        router.openrouter.chat = AsyncMock(
-            return_value=ChatResponse(content="backup response", model="deepseek")
+        router.zhipu.chat = AsyncMock(side_effect=Exception("zhipu down"))
+        router.groq.chat = AsyncMock(
+            return_value=ChatResponse(content="groq response", model="llama-3.3-70b")
         )
 
         result = await router.chat(
             [ChatMessage(role="user", content="test")],
             role=ModelRole.CEO,
         )
-        assert result.content == "backup response"
+        assert result.content == "groq response"
+        router.groq.chat.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ceo_zhipu_groq_down_falls_to_openrouter(self):
+        """When both zhipu_ceo and groq fail, should fallover to openrouter."""
+        router = self._make_router()
+        router.zhipu.chat = AsyncMock(side_effect=Exception("zhipu down"))
+        router.groq.chat = AsyncMock(side_effect=Exception("groq down"))
+        router.openrouter.chat = AsyncMock(
+            return_value=ChatResponse(content="openrouter response", model="deepseek")
+        )
+
+        result = await router.chat(
+            [ChatMessage(role="user", content="test")],
+            role=ModelRole.CEO,
+        )
+        assert result.content == "openrouter response"
         router.openrouter.chat.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_both_fail_raises_router_error(self):
+    async def test_all_three_fail_raises_router_error(self):
+        """All 3 CEO providers fail → RouterError."""
         router = self._make_router()
-        router.nvidia.chat = AsyncMock(side_effect=Exception("nvidia down"))
+        router.zhipu.chat = AsyncMock(side_effect=Exception("zhipu down"))
+        router.groq.chat = AsyncMock(side_effect=Exception("groq down"))
         router.openrouter.chat = AsyncMock(side_effect=Exception("openrouter down"))
 
-        with pytest.raises(RouterError, match="Both primary and backup failed"):
+        with pytest.raises(RouterError, match="All providers failed"):
             await router.chat(
                 [ChatMessage(role="user", content="test")],
                 role=ModelRole.CEO,
@@ -201,9 +228,9 @@ class TestModelRouter:
     @pytest.mark.asyncio
     async def test_rate_limit_triggers_failover(self):
         router = self._make_router()
-        router.nvidia.chat = AsyncMock(side_effect=RateLimitExceeded("silent mode"))
-        router.openrouter.chat = AsyncMock(
-            return_value=ChatResponse(content="fallback", model="deepseek")
+        router.zhipu.chat = AsyncMock(side_effect=RateLimitExceeded("silent mode"))
+        router.groq.chat = AsyncMock(
+            return_value=ChatResponse(content="fallback", model="llama")
         )
 
         result = await router.chat(
@@ -211,6 +238,24 @@ class TestModelRouter:
             role=ModelRole.CEO,
         )
         assert result.content == "fallback"
+
+    @pytest.mark.asyncio
+    async def test_zhipu_ceo_down_does_not_affect_vision(self):
+        """zhipu_ceo DOWN should not affect zhipu for vision."""
+        router = self._make_router()
+        # Mark zhipu_ceo down
+        router._provider_status["zhipu_ceo"] = ProviderStatus.DOWN
+        # zhipu for vision should still be healthy
+        assert router._provider_status["zhipu"] == ProviderStatus.HEALTHY
+
+        expected = ChatResponse(content="vision ok", model="glm-4v-flash")
+        router.zhipu.chat = AsyncMock(return_value=expected)
+
+        result = await router.chat(
+            [ChatMessage(role="user", content="describe")],
+            role=ModelRole.VISION,
+        )
+        assert result.content == "vision ok"
 
     @pytest.mark.asyncio
     async def test_context_bridging_truncates(self):
@@ -243,21 +288,48 @@ class TestModelRouter:
         router.nvidia.health_check = AsyncMock(return_value=True)
         router.zhipu.health_check = AsyncMock(return_value=False)
         router.openrouter.health_check = AsyncMock(return_value=True)
+        router.groq.health_check = AsyncMock(return_value=True)
 
         health = await router.health_check_all()
-        assert health == {"nvidia": True, "zhipu": False, "openrouter": True}
+        assert health == {"nvidia": True, "zhipu": False, "openrouter": True, "groq": True}
+
+    @pytest.mark.asyncio
+    async def test_health_check_all_without_groq(self):
+        router = self._make_router(with_groq=False)
+        router.nvidia.health_check = AsyncMock(return_value=True)
+        router.zhipu.health_check = AsyncMock(return_value=True)
+        router.openrouter.health_check = AsyncMock(return_value=True)
+
+        health = await router.health_check_all()
+        assert health == {"nvidia": True, "zhipu": True, "openrouter": True}
+        assert "groq" not in health
 
     @pytest.mark.asyncio
     async def test_recovery_probe(self):
         router = self._make_router()
-        router._provider_status["nvidia"] = ProviderStatus.DOWN
+        router._provider_status["zhipu_ceo"] = ProviderStatus.DOWN
         router._recovery_interval = 0  # Check immediately
         router._healthy_checks_required = 1
-        router.nvidia.health_check = AsyncMock(return_value=True)
+        router.zhipu.health_check = AsyncMock(return_value=True)
 
         results = await router.probe_recovery()
-        assert results.get("nvidia") == "recovered"
-        assert router._provider_status["nvidia"] == ProviderStatus.HEALTHY
+        assert results.get("zhipu_ceo") == "recovered"
+        assert router._provider_status["zhipu_ceo"] == ProviderStatus.HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_ceo_chain_without_groq(self):
+        """CEO chain without groq: zhipu → openrouter (2 providers)."""
+        router = self._make_router(with_groq=False)
+        router.zhipu.chat = AsyncMock(side_effect=Exception("zhipu down"))
+        router.openrouter.chat = AsyncMock(
+            return_value=ChatResponse(content="openrouter", model="deepseek")
+        )
+
+        result = await router.chat(
+            [ChatMessage(role="user", content="test")],
+            role=ModelRole.CEO,
+        )
+        assert result.content == "openrouter"
 
 
 # ── Live Integration Tests (require API keys) ──────────────────
@@ -306,7 +378,7 @@ class TestLiveIntegration:
 
     @pytest.mark.asyncio
     async def test_full_router_chat(self, router):
-        """Validates: ModelRouter.chat("你好") routes to Kimi K2.5 and returns result."""
+        """Validates: ModelRouter.chat("你好") routes to primary CEO and returns result."""
         response = await router.chat(
             [ChatMessage(role="user", content="你好")],
             role=ModelRole.CEO,

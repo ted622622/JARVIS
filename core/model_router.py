@@ -44,7 +44,7 @@ class ModelRouter:
 
     Responsibilities:
     - Route requests to the correct provider based on role
-    - Automatic failover when primary provider is down
+    - Automatic failover via ordered chain (CEO: zhipu → groq → openrouter)
     - Context bridging when switching between providers with different context windows
     - Health monitoring and recovery probing
     """
@@ -54,11 +54,13 @@ class ModelRouter:
         nvidia_client: NvidiaClient,
         zhipu_client: ZhipuClient,
         openrouter_client: OpenRouterClient,
+        groq_client=None,
         config: dict[str, Any] | None = None,
     ):
         self.nvidia = nvidia_client
         self.zhipu = zhipu_client
         self.openrouter = openrouter_client
+        self.groq = groq_client
         self.config = config or {}
 
         # Failover state
@@ -66,9 +68,11 @@ class ModelRouter:
         self._consecutive_429: dict[str, int] = {}
         self._consecutive_5xx: dict[str, int] = {}
         self._provider_status: dict[str, ProviderStatus] = {
-            "nvidia": ProviderStatus.HEALTHY,
-            "zhipu": ProviderStatus.HEALTHY,
+            "zhipu_ceo": ProviderStatus.HEALTHY,   # zhipu for CEO chain (glm-4.5-air)
+            "zhipu": ProviderStatus.HEALTHY,        # zhipu for VISION/IMAGE
+            "groq": ProviderStatus.HEALTHY,
             "openrouter": ProviderStatus.HEALTHY,
+            "nvidia": ProviderStatus.HEALTHY,       # kept but not in CEO chain
         }
         self._failover_trigger_429 = failover_cfg.get("trigger", {}).get("consecutive_429", 2)
         self._failover_trigger_5xx = failover_cfg.get("trigger", {}).get("consecutive_5xx", 1)
@@ -90,6 +94,24 @@ class ModelRouter:
 
     # ── Public API ──────────────────────────────────────────────
 
+    def _get_chain_for_role(self, role: ModelRole) -> list[tuple[str, dict[str, Any]]]:
+        """Return ordered provider chain for a given role.
+
+        Each entry is (status_key, extra_kwargs) where status_key maps to
+        _provider_status and _get_client_by_name.
+        """
+        if role == ModelRole.CEO:
+            chain = [("zhipu_ceo", {"model": "glm-4.5-air"})]
+            if self.groq is not None:
+                chain.append(("groq", {}))
+            chain.append(("openrouter", {}))
+            return chain
+        elif role == ModelRole.VISION:
+            return [("zhipu", {}), ("openrouter", {"model": "google/gemini-2.0-flash-001"})]
+        elif role == ModelRole.IMAGE:
+            return [("zhipu", {})]
+        raise ValueError(f"Unknown role: {role}")
+
     async def chat(
         self,
         messages: list[ChatMessage],
@@ -97,43 +119,54 @@ class ModelRouter:
         role: ModelRole = ModelRole.CEO,
         **kwargs: Any,
     ) -> ChatResponse:
-        """Send a chat request, automatically routing based on role."""
-        primary, backup = self._get_clients_for_role(role)
+        """Send a chat request, automatically routing based on role with chain failover."""
+        chain = self._get_chain_for_role(role)
+        last_error = None
+        tried_providers: list[str] = []
 
-        # Try primary first
-        if self._provider_status.get(self._provider_name(primary)) != ProviderStatus.DOWN:
+        for status_key, extra_kwargs in chain:
+            if self._provider_status.get(status_key, ProviderStatus.HEALTHY) == ProviderStatus.DOWN:
+                continue
+
+            client = self._get_client_by_name(status_key)
+            if client is None:
+                continue
+
             try:
-                response = await primary.chat(messages, **kwargs)
-                await self._on_success(self._provider_name(primary))
+                merged = {**kwargs, **extra_kwargs}
+                # Apply context bridging if this is not the first provider in chain
+                if tried_providers:
+                    messages = await self._bridge_context(messages, role)
+
+                response = await client.chat(messages, **merged)
+                await self._on_success(status_key)
                 return response
             except RateLimitExceeded:
-                logger.warning(f"Primary provider in silent mode for role={role.value}")
-                await self._mark_down(self._provider_name(primary))
+                logger.warning(f"Provider {status_key} in silent mode for role={role.value}")
+                await self._mark_down(status_key)
+                last_error = f"{status_key} rate limited"
             except Exception as e:
-                logger.warning(f"Primary failed for role={role.value}: {e}")
-                await self._handle_failure(self._provider_name(primary), e)
+                logger.warning(f"Provider {status_key} failed for role={role.value}: {e}")
+                await self._handle_failure(status_key, e)
+                last_error = str(e)
 
-        # Fallback to backup
-        if backup is None:
-            raise RouterError(f"No backup available for role={role.value}")
+            # Record failover
+            tried_providers.append(status_key)
+            # Log failover event to next provider
+            remaining = [(k, _) for k, _ in chain if k not in tried_providers
+                         and self._provider_status.get(k, ProviderStatus.HEALTHY) != ProviderStatus.DOWN
+                         and self._get_client_by_name(k) is not None]
+            if remaining:
+                next_provider = remaining[0][0]
+                self._failover_events.append(FailoverEvent(
+                    from_provider=status_key,
+                    to_provider=next_provider,
+                    reason=last_error or "unknown",
+                    role=role.value,
+                ))
+                logger.info(f"Failing over {status_key} → {next_provider} for role={role.value}")
 
-        primary_name = self._provider_name(primary)
-        backup_name = self._provider_name(backup)
-        logger.info(f"Failing over {primary_name} → {backup_name} for role={role.value}")
-
-        self._failover_events.append(FailoverEvent(
-            from_provider=primary_name,
-            to_provider=backup_name,
-            reason=self._provider_status.get(primary_name, ProviderStatus.DOWN).value,
-            role=role.value,
-        ))
-
-        try:
-            bridged = await self._bridge_context(messages, role)
-            response = await backup.chat(bridged, **kwargs)
-            return response
-        except Exception as e:
-            raise RouterError(f"Both primary and backup failed for role={role.value}: {e}")
+        raise RouterError(f"All providers failed for role={role.value}: {last_error}")
 
     async def generate_image(self, prompt: str, **kwargs: Any) -> ImageResponse:
         """Generate image via Zhipu CogView."""
@@ -209,17 +242,19 @@ class ModelRouter:
 
     async def health_check_all(self) -> dict[str, bool]:
         """Run health checks on all providers concurrently."""
-        results = await asyncio.gather(
+        checks = [
             self.nvidia.health_check(),
             self.zhipu.health_check(),
             self.openrouter.health_check(),
-            return_exceptions=True,
-        )
-        return {
-            "nvidia": results[0] is True,
-            "zhipu": results[1] is True,
-            "openrouter": results[2] is True,
-        }
+        ]
+        labels = ["nvidia", "zhipu", "openrouter"]
+
+        if self.groq is not None:
+            checks.append(self.groq.health_check())
+            labels.append("groq")
+
+        results = await asyncio.gather(*checks, return_exceptions=True)
+        return {label: result is True for label, result in zip(labels, results)}
 
     @property
     def status(self) -> dict[str, str]:
@@ -231,26 +266,16 @@ class ModelRouter:
 
     # ── Internal ────────────────────────────────────────────────
 
-    def _get_clients_for_role(self, role: ModelRole):
-        if role == ModelRole.CEO:
-            return self.nvidia, self.openrouter
-        elif role == ModelRole.VISION:
-            return self.zhipu, self.openrouter
-        elif role == ModelRole.IMAGE:
-            return self.zhipu, None
-        raise ValueError(f"Unknown role: {role}")
-
-    def _provider_name(self, client) -> str:
-        if isinstance(client, NvidiaClient):
-            return "nvidia"
-        if isinstance(client, ZhipuClient):
-            return "zhipu"
-        if isinstance(client, OpenRouterClient):
-            return "openrouter"
-        return "unknown"
-
     def _get_client_by_name(self, name: str):
-        return {"nvidia": self.nvidia, "zhipu": self.zhipu, "openrouter": self.openrouter}.get(name)
+        """Resolve status_key to actual client instance."""
+        mapping = {
+            "nvidia": self.nvidia,
+            "zhipu": self.zhipu,
+            "zhipu_ceo": self.zhipu,   # same client, different status tracking
+            "openrouter": self.openrouter,
+            "groq": self.groq,
+        }
+        return mapping.get(name)
 
     async def _on_success(self, provider: str) -> None:
         async with self._status_lock:
@@ -359,15 +384,18 @@ class ModelRouter:
         )
 
     async def close(self) -> None:
-        await asyncio.gather(
+        tasks = [
             self.nvidia.close(),
             self.zhipu.close(),
             self.openrouter.close(),
-        )
+        ]
+        if self.groq is not None:
+            tasks.append(self.groq.close())
+        await asyncio.gather(*tasks)
 
 
 class RouterError(Exception):
-    """Raised when routing fails (both primary and backup)."""
+    """Raised when routing fails (all providers in chain failed)."""
 
 
 def create_router_from_config(config_path: str = "config/config.yaml") -> ModelRouter:
@@ -377,6 +405,7 @@ def create_router_from_config(config_path: str = "config/config.yaml") -> ModelR
     - NVIDIA_API_KEY
     - ZHIPU_API_KEY
     - OPENROUTER_API_KEY
+    - GROQ_API_KEY (optional)
     """
     import os
 
@@ -404,12 +433,23 @@ def create_router_from_config(config_path: str = "config/config.yaml") -> ModelR
 
     openrouter = OpenRouterClient(
         api_key=os.environ["OPENROUTER_API_KEY"],
-        model=models.get("ceo", {}).get("backup", {}).get("model"),
+        model=models.get("ceo", {}).get("tertiary", {}).get("model")
+            or models.get("ceo", {}).get("backup", {}).get("model"),
     )
+
+    groq_client = None
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if groq_key:
+        from clients.groq_chat_client import GroqChatClient
+        groq_client = GroqChatClient(
+            api_key=groq_key,
+            model=models.get("ceo", {}).get("backup", {}).get("model"),
+        )
 
     return ModelRouter(
         nvidia_client=nvidia,
         zhipu_client=zhipu,
         openrouter_client=openrouter,
+        groq_client=groq_client,
         config=config,
     )

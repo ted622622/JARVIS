@@ -1,7 +1,9 @@
 """Soul — personality loader and system prompt builder.
 
 Loads persona files (SOUL_JARVIS.md / SOUL_CLAWRA.md),
-IDENTITY.md, and USER.md to build system prompts.
+IDENTITY.md, USER.md, and SOUL_GROWTH.md to build system prompts.
+
+Patch J1: SOUL_CORE (config/) + SOUL_GROWTH (memory/) per persona.
 """
 
 from __future__ import annotations
@@ -18,14 +20,18 @@ CORE_DNA_PROMPT = (
     "and energetic smile. Not over-polished, looks like a real person."
 )
 
+# Core soul files — these must not be modified at runtime
+CORE_FILES = {"SOUL_JARVIS.md", "SOUL_CLAWRA.md"}
+
 
 class Soul:
     """Personality manager for J.A.R.V.I.S. and Clawra.
 
     Loads persona-specific SOUL files + shared IDENTITY and USER files.
+    Patch J1: also loads SOUL_GROWTH.md per persona from memory dir.
 
     Usage:
-        soul = Soul(config_dir="./config")
+        soul = Soul(config_dir="./config", memory_dir="./memory")
         soul.load()
         prompt = soul.build_system_prompt("jarvis")
         prompt_clawra = soul.build_system_prompt("clawra")
@@ -35,6 +41,7 @@ class Soul:
         self,
         soul_path: str = "./config/SOUL.md",
         config_dir: str | None = None,
+        memory_dir: str = "./memory",
     ):
         # Support both old single-file and new multi-file modes
         if config_dir:
@@ -42,7 +49,9 @@ class Soul:
         else:
             self._config_dir = Path(soul_path).parent
 
-        self._soul_files: dict[str, str] = {}  # persona -> content
+        self._memory_dir = Path(memory_dir)
+        self._soul_files: dict[str, str] = {}  # persona -> core content
+        self._growth_files: dict[str, str] = {}  # persona -> growth content
         self._identity: str = ""
         self._user: str = ""
         self._loaded = False
@@ -51,7 +60,7 @@ class Soul:
         """Load all persona and shared config files."""
         d = self._config_dir
 
-        # Load persona-specific SOUL files
+        # Load persona-specific SOUL files (CORE — immutable)
         for persona, filename in [
             ("jarvis", "SOUL_JARVIS.md"),
             ("clawra", "SOUL_CLAWRA.md"),
@@ -59,7 +68,7 @@ class Soul:
             path = d / filename
             if path.exists():
                 self._soul_files[persona] = path.read_text(encoding="utf-8")
-                logger.info(f"Soul loaded: {filename} ({len(self._soul_files[persona])} chars)")
+                logger.info(f"Soul CORE loaded: {filename} ({len(self._soul_files[persona])} chars)")
             else:
                 logger.debug(f"{filename} not found, will use defaults")
 
@@ -70,6 +79,17 @@ class Soul:
                 content = old_path.read_text(encoding="utf-8")
                 self._soul_files["_unified"] = content
                 logger.info(f"Soul loaded from SOUL.md (legacy, {len(content)} chars)")
+
+        # J1: Load SOUL_GROWTH.md per persona (appendable)
+        for persona in ("jarvis", "clawra"):
+            growth_path = self._memory_dir / persona / "SOUL_GROWTH.md"
+            if growth_path.exists():
+                content = growth_path.read_text(encoding="utf-8").strip()
+                # Only include if there's actual content beyond the header
+                lines = [l for l in content.split("\n") if l.strip() and not l.startswith("#") and not l.startswith("<!--")]
+                if lines:
+                    self._growth_files[persona] = "\n".join(lines)
+                    logger.info(f"Soul GROWTH loaded: {persona} ({len(lines)} entries)")
 
         # Load shared files
         identity_path = d / "IDENTITY.md"
@@ -84,9 +104,33 @@ class Soul:
 
         self._loaded = True
 
+    def reload_growth(self, persona: str | None = None) -> None:
+        """Reload GROWTH files without reloading CORE.
+
+        Called after SoulGrowth appends new entries.
+        """
+        personas = [persona] if persona else ["jarvis", "clawra"]
+        for p in personas:
+            growth_path = self._memory_dir / p / "SOUL_GROWTH.md"
+            if growth_path.exists():
+                content = growth_path.read_text(encoding="utf-8").strip()
+                lines = [l for l in content.split("\n") if l.strip() and not l.startswith("#") and not l.startswith("<!--")]
+                if lines:
+                    self._growth_files[p] = "\n".join(lines)
+                else:
+                    self._growth_files.pop(p, None)
+
     @property
     def is_loaded(self) -> bool:
         return self._loaded
+
+    def get_core_content(self, persona: str) -> str:
+        """Return the raw CORE soul content for a persona (for SoulGuard validation)."""
+        return self._soul_files.get(persona, "")
+
+    def get_growth_content(self, persona: str) -> str:
+        """Return the raw GROWTH content for a persona."""
+        return self._growth_files.get(persona, "")
 
     def build_system_prompt(
         self,
@@ -95,7 +139,7 @@ class Soul:
     ) -> str:
         """Build a system prompt for the given persona.
 
-        Combines: SOUL_{persona}.md + USER.md + extra_context
+        Combines: SOUL_{persona}.md (CORE) + SOUL_GROWTH (learned) + USER.md + extra_context
         IDENTITY.md is for reference, not injected into every prompt.
         """
         # Get persona-specific soul content
@@ -115,6 +159,13 @@ class Soul:
 
         # Build from loaded files
         parts = [soul_content.strip()]
+
+        # J1: Append GROWTH content (learned preferences)
+        growth = self._growth_files.get(persona, "")
+        if growth:
+            parts.append("")
+            parts.append("## 從互動中學到的偏好")
+            parts.append(growth)
 
         if self._user:
             parts.append("")

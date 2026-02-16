@@ -1,4 +1,4 @@
-"""NVIDIA NIM client for Kimi K2.5 with Token Bucket rate limiting."""
+"""NVIDIA NIM client for DeepSeek V3.1 with Token Bucket rate limiting."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .base_client import (
 
 
 class NvidiaClient(BaseClient):
-    """Wraps Kimi K2.5 via NVIDIA NIM API.
+    """Wraps DeepSeek V3.1 via NVIDIA NIM API.
 
     Features:
     - Token Bucket rate limiting (40 RPM → 0.667 tokens/sec)
@@ -26,7 +26,7 @@ class NvidiaClient(BaseClient):
     - Silent mode: 15 min cooldown when 429 > 10/hr
     """
 
-    DEFAULT_MODEL = "moonshotai/kimi-k2.5-instruct"
+    DEFAULT_MODEL = "deepseek-ai/deepseek-v3.1"
 
     def __init__(
         self,

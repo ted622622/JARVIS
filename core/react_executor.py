@@ -144,8 +144,12 @@ class TaskResult:
 FALLBACK_CHAINS: dict[str, list[str]] = {
     "web_browse":     ["browser", "knowledge"],
     "web_search":     ["browser", "knowledge"],
+    "maps_search":    ["browser", "knowledge"],
     "file_operation": ["interpreter", "code", "knowledge"],
     "code_task":      ["code", "knowledge"],
+    "calendar":       ["gog", "knowledge"],    # H1 v2: gog CLI first
+    "email":          ["gog", "knowledge"],    # H1 v2: gog CLI first
+    "booking":        ["browser", "knowledge"],
     "general":        ["knowledge"],
 }
 
