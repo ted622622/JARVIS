@@ -255,6 +255,20 @@ async def main() -> None:
         gog_worker=gog_worker if gog_worker.is_available else None,
     )
 
+    # S3: SearchWorker — consolidated DuckDuckGo search
+    from workers.search_worker import SearchWorker
+
+    workers["search"] = SearchWorker()
+
+    # S2: TranscribeWorker — long audio ASR + meeting summary
+    from workers.transcribe_worker import TranscribeWorker
+
+    transcribe_worker = TranscribeWorker(
+        model_router=router,
+        zhipu_key=os.environ.get("ZHIPU_API_KEY", ""),
+    )
+    workers["transcribe"] = transcribe_worker
+
     ceo.workers = workers
     logger.info(f"  [8/12] Workers initialized ({len(workers)} workers)")
 
@@ -296,8 +310,9 @@ async def main() -> None:
     ceo._shared_memory = shared_memory
     logger.info("  [8e/12] Patch J modules initialized (SoulGrowth, SharedMemory, SoulGuard)")
 
-    # Inject voice worker into Telegram client
+    # Inject voice + transcribe workers into Telegram client
     telegram.voice_worker = voice_worker
+    telegram.transcribe_worker = transcribe_worker
 
     # Initialize Groq STT client if key present
     groq_key = os.environ.get("GROQ_API_KEY", "")
@@ -377,6 +392,26 @@ async def main() -> None:
     )
     ceo._post_action = post_action
     logger.info("  [9b/12] PostActionChain initialized")
+
+    # S4: SkillLearner — observe user patterns, propose automations
+    from core.skill_learner import SkillLearner
+
+    skill_learner = SkillLearner(
+        scheduler=heartbeat.scheduler,
+        telegram=telegram,
+        model_router=router,
+    )
+    ceo._skill_learner = skill_learner
+    # Daily cron job at 03:30 to propose learned skills
+    heartbeat.scheduler.add_job(
+        skill_learner.propose_skills,
+        "cron",
+        hour=3,
+        minute=30,
+        id="skill_learner_propose",
+        name="Skill Learner Proposal",
+    )
+    logger.info("  [9c/12] SkillLearner initialized (daily 03:30 proposals)")
 
     # ── Step 10: Telegram polling ─────────────────────────────────
     async def on_telegram_message(user_text: str, chat_id: int, persona: str = "jarvis") -> dict | str:

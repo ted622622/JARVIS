@@ -86,6 +86,7 @@ class TelegramClient:
         # Voice components (injected after init)
         self._voice_worker = None
         self._stt_client = None
+        self._transcribe_worker = None
         self._voice_cache_dir = Path("./data/voice_cache")
         self._voice_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -118,6 +119,14 @@ class TelegramClient:
     @stt_client.setter
     def stt_client(self, client) -> None:
         self._stt_client = client
+
+    @property
+    def transcribe_worker(self):
+        return self._transcribe_worker
+
+    @transcribe_worker.setter
+    def transcribe_worker(self, worker) -> None:
+        self._transcribe_worker = worker
 
     def _get_bot(self, persona: str = "jarvis") -> Bot | None:
         if persona == "clawra" and self._clawra_bot:
@@ -512,6 +521,80 @@ class TelegramClient:
             else:
                 await update.message.reply_text("Sir, 語音處理暫時出了點問題，我正在處理中。")
 
+    async def _handle_audio_document(self, update: Update, context: Any) -> None:
+        """Process incoming audio documents (long recordings) via TranscribeWorker."""
+        if not update.message:
+            return
+
+        # Determine which attachment we got
+        audio = update.message.audio or update.message.document
+        if not audio:
+            return
+
+        user_id = update.message.from_user.id if update.message.from_user else None
+        if not self._is_authorized(user_id):
+            logger.warning(f"Unauthorized audio from user {user_id} blocked")
+            return
+
+        chat_id = update.message.chat_id
+        bot_token = context.bot.token
+        persona = self._token_to_persona.get(bot_token, "jarvis")
+
+        if not self._transcribe_worker:
+            await update.message.reply_text(
+                "Sir，長音檔轉錄模組尚未啟用。" if persona == "jarvis"
+                else "欸～我現在還沒辦法處理長音檔耶 ><"
+            )
+            return
+
+        # Check file extension
+        file_name = audio.file_name or ""
+        suffix = Path(file_name).suffix.lower() if file_name else ""
+        mime = getattr(audio, "mime_type", "") or ""
+        is_audio = suffix in {".ogg", ".mp3", ".m4a", ".wav", ".flac", ".opus"} or mime.startswith("audio/")
+
+        if not is_audio:
+            return  # Not an audio file, ignore
+
+        await update.message.reply_text(
+            "收到音檔，正在轉錄中，請稍候 ..." if persona == "jarvis"
+            else "收到～讓我聽聽看，等我一下喔～"
+        )
+
+        # Download audio file
+        try:
+            dl_file = await audio.get_file()
+            ext = suffix or ".ogg"
+            local_path = self._voice_cache_dir / f"transcribe_{update.message.message_id}{ext}"
+            await dl_file.download_to_drive(str(local_path))
+        except Exception as e:
+            logger.error(f"Failed to download audio document: {e}")
+            await update.message.reply_text("Sir，音檔下載失敗，請再試一次。")
+            return
+
+        # Transcribe + summarize
+        try:
+            caption = update.message.caption or ""
+            result = await self._transcribe_worker.process_audio(
+                str(local_path), context=caption,
+            )
+
+            if result.get("error"):
+                await update.message.reply_text(f"轉錄失敗: {result['error']}")
+            else:
+                summary = result.get("result", "")
+                if summary:
+                    # Split long messages (Telegram 4096 char limit)
+                    for i in range(0, len(summary), 4000):
+                        await update.message.reply_text(summary[i:i + 4000])
+                else:
+                    await update.message.reply_text("轉錄完成但未產生摘要。")
+        except Exception as e:
+            logger.error(f"Transcribe worker failed: {e}")
+            await update.message.reply_text("Sir，轉錄處理出了點問題。")
+        finally:
+            local_path.unlink(missing_ok=True)
+
     def build_applications(self) -> list[Application]:
         """Build telegram Applications for all configured bots.
 
@@ -535,6 +618,9 @@ class TelegramClient:
             ))
             app.add_handler(MessageHandler(
                 filters.VOICE, self._handle_voice_message,
+            ))
+            app.add_handler(MessageHandler(
+                filters.AUDIO | filters.Document.AUDIO, self._handle_audio_document,
             ))
             app.add_handler(CallbackQueryHandler(self.handle_callback_query))
             if persona == "jarvis":

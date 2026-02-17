@@ -143,7 +143,7 @@ class TaskResult:
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
     "web_browse":     ["browser", "knowledge"],
-    "web_search":     ["browser", "knowledge"],
+    "web_search":     ["browser", "search", "knowledge"],
     "maps_search":    ["browser", "knowledge"],
     "file_operation": ["interpreter", "code", "knowledge"],
     "code_task":      ["code", "knowledge"],
