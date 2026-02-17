@@ -50,6 +50,7 @@ class EmotionClassifier:
             response = await self.router.chat(
                 [ChatMessage(role="user", content=prompt)],
                 role=ModelRole.CEO,
+                task_type="template",
                 max_tokens=20,
                 temperature=0.1,
             )

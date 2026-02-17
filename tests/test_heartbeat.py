@@ -477,6 +477,155 @@ class TestTelegramClient:
             mock_bot.send_chat_action.assert_called_with(chat_id=123, action="typing")
 
 
+# ── Patch O: Long-task Ack + Fallback Tests ───────────────────────
+
+
+class TestTelegramLongTaskAck:
+    """Test Telegram long-task acknowledgement and empty reply fallback."""
+
+    def _make_client(self):
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient(jarvis_token="fake", chat_id=123)
+        return client
+
+    def _make_update(self, text="你好", user_id=123):
+        update = MagicMock()
+        update.message.text = text
+        update.message.chat_id = 123
+        update.message.from_user.id = user_id
+        update.message.from_user.first_name = "Ted"
+        update.message.reply_text = AsyncMock()
+        update.message.reply_photo = AsyncMock()
+        return update
+
+    @pytest.mark.asyncio
+    async def test_ack_sent_for_long_task(self):
+        """Long task (URL) → ack message sent before CEO call."""
+        client = self._make_client()
+        ceo_ref = MagicMock()
+        ceo_ref.estimate_complexity.return_value = {
+            "is_long": True, "reason": "web_task", "estimate_seconds": 45,
+        }
+        client.set_ceo_ref(ceo_ref)
+        client.set_message_handler(AsyncMock(return_value="結果來了"))
+
+        update = self._make_update("幫我看 https://example.com")
+        ctx = MagicMock()
+        ctx.bot.token = "fake"
+        client._token_to_persona["fake"] = "jarvis"
+
+        await client._handle_text_message(update, ctx)
+
+        # First call = ack, second call = actual reply
+        calls = update.message.reply_text.call_args_list
+        assert len(calls) >= 2
+        assert "45" in calls[0][0][0]
+        assert "處理中" in calls[0][0][0]
+
+    @pytest.mark.asyncio
+    async def test_no_ack_for_simple_message(self):
+        """Simple message → no ack, just direct reply."""
+        client = self._make_client()
+        ceo_ref = MagicMock()
+        ceo_ref.estimate_complexity.return_value = {
+            "is_long": False, "reason": "", "estimate_seconds": 5,
+        }
+        client.set_ceo_ref(ceo_ref)
+        client.set_message_handler(AsyncMock(return_value="你好！"))
+
+        update = self._make_update("你好")
+        ctx = MagicMock()
+        ctx.bot.token = "fake"
+        client._token_to_persona["fake"] = "jarvis"
+
+        await client._handle_text_message(update, ctx)
+
+        calls = update.message.reply_text.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == "你好！"
+
+    @pytest.mark.asyncio
+    async def test_clawra_ack_style(self):
+        """Clawra persona → casual ack style."""
+        client = self._make_client()
+        ceo_ref = MagicMock()
+        ceo_ref.estimate_complexity.return_value = {
+            "is_long": True, "reason": "web_task", "estimate_seconds": 45,
+        }
+        client.set_ceo_ref(ceo_ref)
+        client.set_message_handler(AsyncMock(return_value="搜到了"))
+
+        update = self._make_update("搜尋最新新聞")
+        ctx = MagicMock()
+        ctx.bot.token = "fake"
+        client._token_to_persona["fake"] = "clawra"
+
+        with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock):
+            await client._handle_text_message(update, ctx)
+
+        calls = update.message.reply_text.call_args_list
+        assert "欸收到" in calls[0][0][0]
+
+    @pytest.mark.asyncio
+    async def test_empty_reply_friendly_fallback_jarvis(self):
+        """Empty reply as JARVIS → friendly fallback, not （無回覆）."""
+        client = self._make_client()
+        client.set_message_handler(AsyncMock(return_value=""))
+
+        update = self._make_update("測試")
+        ctx = MagicMock()
+        ctx.bot.token = "fake"
+        client._token_to_persona["fake"] = "jarvis"
+
+        await client._handle_text_message(update, ctx)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "（無回覆）" not in reply_text
+        assert "Sir" in reply_text
+
+    @pytest.mark.asyncio
+    async def test_empty_reply_friendly_fallback_clawra(self):
+        """Empty reply as Clawra → casual fallback."""
+        client = self._make_client()
+        client.set_message_handler(AsyncMock(return_value=""))
+
+        update = self._make_update("測試")
+        ctx = MagicMock()
+        ctx.bot.token = "fake"
+        client._token_to_persona["fake"] = "clawra"
+
+        with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock):
+            await client._handle_text_message(update, ctx)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "（無回覆）" not in reply_text
+        assert "換個方式" in reply_text
+
+    @pytest.mark.asyncio
+    async def test_no_ceo_ref_no_crash(self):
+        """Without CEO ref set, should still work (no ack, just reply)."""
+        client = self._make_client()
+        client.set_message_handler(AsyncMock(return_value="OK"))
+
+        update = self._make_update("你好")
+        ctx = MagicMock()
+        ctx.bot.token = "fake"
+        client._token_to_persona["fake"] = "jarvis"
+
+        await client._handle_text_message(update, ctx)
+
+        calls = update.message.reply_text.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == "OK"
+
+    def test_set_ceo_ref(self):
+        """set_ceo_ref stores reference."""
+        client = self._make_client()
+        mock_ceo = MagicMock()
+        client.set_ceo_ref(mock_ceo)
+        assert client._ceo_ref is mock_ceo
+
+
 # ── Pending Task Retry Tests ──────────────────────────────────────
 
 
@@ -810,3 +959,224 @@ class TestGogHelpers:
         hb = Heartbeat(gog_worker=mock_gog)
         result = hb._get_gog_events_for_date(datetime.now())
         assert len(result) == 1
+
+
+# ── Patch M: Pending Selfie Check Tests ──────────────────────────
+
+
+class TestPendingSelfieCheck:
+    @pytest.mark.asyncio
+    async def test_no_pending_file(self, tmp_path):
+        """No pending_selfies.json → returns 0."""
+        hb = Heartbeat(fal_client=MagicMock())
+        # Point to non-existent file via monkeypatch
+        import core.heartbeat as hb_mod
+        original = hb_mod.Path
+        hb_mod.Path = lambda p: tmp_path / "nonexistent.json" if "pending_selfies" in str(p) else original(p)
+        try:
+            result = await hb.check_pending_selfies()
+            assert result["checked"] == 0
+        finally:
+            hb_mod.Path = original
+
+    @pytest.mark.asyncio
+    async def test_delivers_completed_selfie(self, tmp_path, mock_telegram):
+        """Completed selfie → fetch + send_photo + mark delivered."""
+        import json
+
+        entries = [{
+            "id": "selfie_123",
+            "status_url": "https://queue.fal.run/status/123",
+            "response_url": "https://queue.fal.run/result/123",
+            "persona": "clawra",
+            "created_at": time.time(),
+            "status": "pending",
+        }]
+
+        from clients.fal_client import FalImageResponse
+        mock_fal = MagicMock()
+        mock_fal.check_queue_status = AsyncMock(return_value="COMPLETED")
+        mock_fal.fetch_queue_result = AsyncMock(return_value=FalImageResponse(
+            url="https://fal.ai/selfie.jpg", width=1024, height=1024,
+        ))
+
+        mock_telegram.send_photo = AsyncMock()
+
+        hb = Heartbeat(telegram=mock_telegram, fal_client=mock_fal)
+
+        # Monkey-patch the path used in check_pending_selfies
+        with patch("core.heartbeat.Path") as mock_path_cls:
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_path.read_text.return_value = json.dumps(entries)
+            mock_path.write_text = MagicMock()
+            mock_path_cls.return_value = mock_path
+
+            result = await hb.check_pending_selfies()
+
+        assert result["checked"] == 1
+        assert result["delivered"] == 1
+        mock_telegram.send_photo.assert_awaited_once()
+        # Verify caption for clawra
+        call_kwargs = mock_telegram.send_photo.call_args
+        assert "欸嘿" in str(call_kwargs)
+
+    @pytest.mark.asyncio
+    async def test_expired_selfie(self, tmp_path):
+        """Selfie older than 1 hour → marked expired."""
+        import json
+
+        entries = [{
+            "id": "selfie_old",
+            "status_url": "https://queue.fal.run/status/old",
+            "response_url": "https://queue.fal.run/result/old",
+            "persona": "clawra",
+            "created_at": time.time() - 7200,  # 2 hours ago
+            "status": "pending",
+        }]
+
+        mock_fal = AsyncMock()
+        hb = Heartbeat(fal_client=mock_fal)
+
+        with patch("core.heartbeat.Path") as mock_path_cls:
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_path.read_text.return_value = json.dumps(entries)
+            written_data = {}
+            def capture_write(data, encoding="utf-8"):
+                written_data["content"] = data
+            mock_path.write_text = capture_write
+            mock_path_cls.return_value = mock_path
+
+            result = await hb.check_pending_selfies()
+
+        assert result["delivered"] == 0
+        # Verify the entry was marked expired
+        saved = json.loads(written_data["content"])
+        assert saved[0]["status"] == "expired"
+        # fal_client should NOT have been called
+        mock_fal.check_queue_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_selfie(self, tmp_path):
+        """Failed job → marked failed."""
+        import json
+
+        entries = [{
+            "id": "selfie_fail",
+            "status_url": "https://queue.fal.run/status/fail",
+            "response_url": "https://queue.fal.run/result/fail",
+            "persona": "jarvis",
+            "created_at": time.time(),
+            "status": "pending",
+        }]
+
+        mock_fal = AsyncMock()
+        mock_fal.check_queue_status.return_value = "FAILED"
+        hb = Heartbeat(fal_client=mock_fal)
+
+        with patch("core.heartbeat.Path") as mock_path_cls:
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_path.read_text.return_value = json.dumps(entries)
+            written_data = {}
+            def capture_write(data, encoding="utf-8"):
+                written_data["content"] = data
+            mock_path.write_text = capture_write
+            mock_path_cls.return_value = mock_path
+
+            result = await hb.check_pending_selfies()
+
+        assert result["delivered"] == 0
+        saved = json.loads(written_data["content"])
+        assert saved[0]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_still_in_progress(self, tmp_path):
+        """In-progress job → stays pending."""
+        import json
+
+        entries = [{
+            "id": "selfie_ip",
+            "status_url": "https://queue.fal.run/status/ip",
+            "response_url": "https://queue.fal.run/result/ip",
+            "persona": "clawra",
+            "created_at": time.time(),
+            "status": "pending",
+        }]
+
+        mock_fal = AsyncMock()
+        mock_fal.check_queue_status.return_value = "IN_PROGRESS"
+        hb = Heartbeat(fal_client=mock_fal)
+
+        with patch("core.heartbeat.Path") as mock_path_cls:
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_path.read_text.return_value = json.dumps(entries)
+            written_data = {}
+            def capture_write(data, encoding="utf-8"):
+                written_data["content"] = data
+            mock_path.write_text = capture_write
+            mock_path_cls.return_value = mock_path
+
+            result = await hb.check_pending_selfies()
+
+        assert result["delivered"] == 0
+        saved = json.loads(written_data["content"])
+        assert saved[0]["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_has_pending_selfie_job_with_fal(self):
+        """When fal_client is provided, pending_selfies_check job exists."""
+        mock_fal = MagicMock()
+        hb = Heartbeat(fal_client=mock_fal)
+        hb.start()
+        job_ids = [j["id"] for j in hb.get_jobs()]
+        assert "pending_selfies_check" in job_ids
+        hb.stop()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_no_pending_selfie_job_without_fal(self):
+        """Without fal_client, no pending_selfies_check job."""
+        hb = Heartbeat()
+        hb.start()
+        job_ids = [j["id"] for j in hb.get_jobs()]
+        assert "pending_selfies_check" not in job_ids
+        hb.stop()
+
+    @pytest.mark.asyncio
+    async def test_jarvis_persona_caption(self, mock_telegram):
+        """Jarvis persona gets different caption."""
+        import json
+        from clients.fal_client import FalImageResponse
+
+        entries = [{
+            "id": "selfie_j",
+            "status_url": "https://queue.fal.run/status/j",
+            "response_url": "https://queue.fal.run/result/j",
+            "persona": "jarvis",
+            "created_at": time.time(),
+            "status": "pending",
+        }]
+
+        mock_fal = MagicMock()
+        mock_fal.check_queue_status = AsyncMock(return_value="COMPLETED")
+        mock_fal.fetch_queue_result = AsyncMock(return_value=FalImageResponse(
+            url="https://fal.ai/selfie_j.jpg", width=1024, height=1024,
+        ))
+
+        mock_telegram.send_photo = AsyncMock()
+
+        hb = Heartbeat(telegram=mock_telegram, fal_client=mock_fal)
+
+        with patch("core.heartbeat.Path") as mock_path_cls:
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_path.read_text.return_value = json.dumps(entries)
+            mock_path.write_text = MagicMock()
+            mock_path_cls.return_value = mock_path
+
+            await hb.check_pending_selfies()
+
+        call_kwargs = mock_telegram.send_photo.call_args
+        assert "Sir" in str(call_kwargs)

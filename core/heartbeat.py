@@ -12,8 +12,10 @@ Scheduled jobs:
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -47,6 +49,7 @@ class Heartbeat:
         react_executor: Any = None,
         gog_worker: Any = None,
         reminder_manager: Any = None,
+        fal_client: Any = None,
     ):
         self.router = model_router
         self.memos = memos
@@ -58,6 +61,7 @@ class Heartbeat:
         self.react = react_executor
         self.gog = gog_worker
         self.reminder = reminder_manager
+        self.fal_client = fal_client
 
         self.scheduler = AsyncIOScheduler()
         self._running = False
@@ -150,6 +154,16 @@ class Heartbeat:
                 minutes=15,
                 id="pending_tasks",
                 name="Pending Task Retry",
+            )
+
+        # Pending selfie check (Patch M)
+        if self.fal_client:
+            self.scheduler.add_job(
+                self.check_pending_selfies,
+                "interval",
+                minutes=5,
+                id="pending_selfies_check",
+                name="Pending Selfie Check",
             )
 
         self.scheduler.start()
@@ -440,6 +454,56 @@ class Heartbeat:
         logger.info(f"Pending task retry: {summary}")
         return summary
 
+    async def check_pending_selfies(self) -> dict[str, Any]:
+        """Check if any delayed selfie generations completed on fal.ai."""
+        path = Path("./data/pending_selfies.json")
+        if not path.exists():
+            return {"checked": 0, "delivered": 0}
+
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {"checked": 0, "delivered": 0}
+
+        updated: list[dict] = []
+        delivered = 0
+
+        for entry in entries:
+            if entry.get("status") != "pending":
+                updated.append(entry)
+                continue
+
+            # Expire after 1 hour
+            if time.time() - entry.get("created_at", 0) > 3600:
+                entry["status"] = "expired"
+                updated.append(entry)
+                continue
+
+            try:
+                status = await self.fal_client.check_queue_status(entry["status_url"])
+                if status == "COMPLETED":
+                    result = await self.fal_client.fetch_queue_result(entry["response_url"])
+                    persona = entry.get("persona", "clawra")
+                    caption = "欸嘿～剛剛的照片好了！" if persona == "clawra" else "Sir, 照片已備妥。"
+                    if self.telegram:
+                        await self.telegram.send_photo(result.url, caption=caption, persona=persona)
+                    entry["status"] = "delivered"
+                    delivered += 1
+                elif status == "FAILED":
+                    entry["status"] = "failed"
+                else:
+                    pass  # still pending, keep as-is
+            except Exception as e:
+                logger.warning(f"Pending selfie check error: {e}")
+
+            updated.append(entry)
+
+        # Save back
+        path.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+        if delivered:
+            logger.info(f"Delivered {delivered} delayed selfie(s)")
+        return {"checked": len(entries), "delivered": delivered}
+
     async def evening_summary(self) -> str:
         """Nightly summary: today recap + tomorrow preview.
 
@@ -553,6 +617,7 @@ class Heartbeat:
             response = await self.router.chat(
                 [ChatMessage(role="user", content=prompt)],
                 role=ModelRole.CEO,
+                task_type="template",
                 max_tokens=200,
             )
             return response.content

@@ -49,6 +49,30 @@ _MAPS_EXTRACT_PROMPT = """你看到的是 Google Maps 的搜尋結果頁面截�
 只回覆 JSON，不要其他文字。"""
 
 
+def _html_to_text(html: str) -> str:
+    """Convert HTML to plain text using stdlib only.
+
+    Strips <script>, <style>, <nav>, <header>, <footer> blocks,
+    then removes remaining tags and collapses whitespace.
+    """
+    # Remove script/style/nav blocks entirely
+    text = re.sub(
+        r'<\s*(script|style|nav|header|footer|noscript|svg)[^>]*>.*?</\s*\1\s*>',
+        ' ', html, flags=re.DOTALL | re.IGNORECASE,
+    )
+    # Replace <br>, <p>, <div>, <li>, <tr> with newlines for readability
+    text = re.sub(r'<\s*(?:br|/p|/div|/li|/tr|/h[1-6])[^>]*>', '\n', text, flags=re.IGNORECASE)
+    # Strip remaining tags
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # Decode common HTML entities
+    import html as _html
+    text = _html.unescape(text)
+    # Collapse whitespace (keep newlines for structure)
+    text = re.sub(r'[^\S\n]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 class BrowserWorker:
     """Worker for web tasks — HTTP fetch and Chrome automation.
 
@@ -79,6 +103,7 @@ class BrowserWorker:
         self._pw: Any = None
         self._pw_context: Any = None
         self._browser: Any = None  # CDP browser handle
+        self._pw_available: bool | None = None  # cache Playwright/CDP status
 
         # Ensure isolated profile directory exists
         Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
@@ -117,7 +142,12 @@ class BrowserWorker:
 
             # Only return text-based content
             if "text" in content_type or "json" in content_type or "xml" in content_type:
-                body = resp.text[:MAX_RESPONSE_SIZE]
+                raw = resp.text[:MAX_RESPONSE_SIZE]
+                # Convert HTML to plain text for LLM consumption
+                if "html" in content_type:
+                    body = _html_to_text(raw)
+                else:
+                    body = raw
             else:
                 body = f"[Binary content: {content_type}, {len(resp.content)} bytes]"
 
@@ -203,6 +233,8 @@ class BrowserWorker:
         """
         if not _HAS_PLAYWRIGHT:
             raise RuntimeError("playwright not installed")
+        if self._pw_available is False:
+            raise RuntimeError("Playwright previously failed, skipping")
         if self._pw_context:
             return self._pw_context
 
@@ -214,6 +246,7 @@ class BrowserWorker:
         try:
             self._browser = await self._pw.chromium.connect_over_cdp(cdp_url)
             self._pw_context = self._browser.contexts[0]
+            self._pw_available = True
             logger.info("Connected to existing Chrome via CDP")
             return self._pw_context
         except Exception:
@@ -243,11 +276,13 @@ class BrowserWorker:
             try:
                 self._browser = await self._pw.chromium.connect_over_cdp(cdp_url)
                 self._pw_context = self._browser.contexts[0]
+                self._pw_available = True
                 logger.info(f"Connected to Chrome via CDP (attempt {attempt + 1})")
                 return self._pw_context
             except Exception:
                 logger.debug(f"CDP connect attempt {attempt + 1} failed, retrying...")
 
+        self._pw_available = False
         raise RuntimeError("Failed to connect to Chrome after 10 attempts")
 
     async def _screenshot_to_data_url(self, page: Any) -> str:

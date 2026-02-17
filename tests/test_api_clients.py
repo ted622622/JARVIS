@@ -162,9 +162,9 @@ class TestModelRouter:
 
     @pytest.mark.asyncio
     async def test_routes_ceo_to_zhipu(self):
-        """CEO chain primary is zhipu (glm-4.5-air)."""
+        """CEO chain primary is zhipu (glm-4.6v by default)."""
         router = self._make_router()
-        expected = ChatResponse(content="response", model="glm-4.5-air")
+        expected = ChatResponse(content="response", model="glm-4.6v")
         router.zhipu.chat = AsyncMock(return_value=expected)
 
         result = await router.chat(
@@ -173,10 +173,9 @@ class TestModelRouter:
         )
         assert result.content == "response"
         router.zhipu.chat.assert_awaited_once()
-        # model override should include glm-4.5-air
+        # model override should include the CEO model from env (default: glm-4.6v)
         call_kwargs = router.zhipu.chat.call_args
-        assert call_kwargs[1].get("model") == "glm-4.5-air" or \
-               (len(call_kwargs) > 1 and call_kwargs[1].get("model") == "glm-4.5-air")
+        assert call_kwargs[1].get("model") == router.select_model("ceo")
 
     @pytest.mark.asyncio
     async def test_ceo_zhipu_down_falls_to_groq(self):

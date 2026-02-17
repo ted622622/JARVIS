@@ -277,6 +277,142 @@ class TestSoulGrowth:
 
 
 # ════════════════════════════════════════════════════════════════
+# Patch Q: SoulGrowth selfie preference learning
+# ════════════════════════════════════════════════════════════════
+
+
+class TestSoulGrowthSelfiePreference:
+    """Test selfie appearance preference detection and extraction."""
+
+    def setup_method(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.memory_dir = self.tmpdir / "memory"
+        self.memory_dir.mkdir()
+        for p in ("jarvis", "clawra"):
+            d = self.memory_dir / p
+            d.mkdir()
+            (d / "SOUL_GROWTH.md").write_text(f"# {p} Growth\n\n", encoding="utf-8")
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_extract_ponytail_like(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("馬尾好看")
+        assert result is not None
+        assert "[selfie-pref]" in result
+        assert "like:hairstyle:ponytail" in result
+
+    def test_extract_twintails_dislike(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("不喜歡雙馬尾")
+        assert result is not None
+        assert "dislike:hairstyle:twintails" in result
+
+    def test_extract_coat_like(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("外套好看")
+        assert result is not None
+        assert "like:outfit:coat" in result
+
+    def test_extract_cafe_scene_like(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("咖啡廳不錯")
+        assert result is not None
+        assert "like:scene:cafe" in result
+
+    def test_extract_ugly_dislike(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("辮子醜")
+        assert result is not None
+        assert "dislike:hairstyle:braided" in result
+
+    def test_generic_category_returns_none(self):
+        """Generic '髮型' without specific hairstyle should return None."""
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("髮型好看")
+        assert result is None
+
+    def test_no_selfie_context_returns_none(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("今天天氣真好")
+        assert result is None
+
+    def test_sentiment_after_category(self):
+        """Test 'category + sentiment' ordering: '捲髮好可愛'."""
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("捲髮好可愛")
+        # "好可愛" contains "可愛" which is in sentiment list
+        # "捲髮" → category
+        # The regex should match category2...sentiment2
+        assert result is not None
+        assert "like:hairstyle:curly" in result
+
+    def test_negative_weird(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("包包頭怪怪的")
+        assert result is not None
+        assert "dislike:hairstyle:bun" in result
+
+    def test_maybe_learn_with_selfie_preference(self):
+        """Full flow: maybe_learn detects selfie pref and saves to SOUL_GROWTH."""
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        # Fill up to interval
+        for i in range(9):
+            sg.maybe_learn("clawra", "hi", "嗨～")
+        # Turn 10 with selfie feedback
+        result = sg.maybe_learn("clawra", "馬尾好看", "謝謝～")
+        assert result is not None
+        assert "[selfie-pref]" in result
+        assert "like:hairstyle:ponytail" in result
+        # Verify saved to file
+        content = (self.memory_dir / "clawra" / "SOUL_GROWTH.md").read_text(encoding="utf-8")
+        assert "[selfie-pref]" in content
+
+    def test_selfie_pref_only_for_clawra(self):
+        """Selfie preference extraction should only apply to Clawra."""
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        for i in range(9):
+            sg.maybe_learn("jarvis", "hi", "hello")
+        # JARVIS doesn't have selfie prefs — "好看" should match _CLAWRA pattern but
+        # _JARVIS pattern doesn't include "好看", so it won't even get to _extract_insight
+        result = sg.maybe_learn("jarvis", "馬尾好看", "好的 Sir")
+        assert result is None  # "好看" not in JARVIS learn patterns
+
+    def test_supercute_sentiment(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("超好看的半綁")
+        assert result is not None
+        assert "like:hairstyle:half-up" in result
+
+    def test_hongdae_scene(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("喜歡弘大")
+        assert result is not None
+        assert "like:scene:Hongdae" in result
+
+    def test_dress_dislike(self):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(self.memory_dir))
+        result = sg._extract_selfie_preference("不好看洋裝")
+        assert result is not None
+        assert "dislike:outfit:dress" in result
+
+
+# ════════════════════════════════════════════════════════════════
 # J4: SharedMemory
 # ════════════════════════════════════════════════════════════════
 

@@ -9,8 +9,11 @@ models:
   ceo:
     primary:
       provider: "zhipu"
-      model: "glm-4.5-air"
+      model: "glm-4.6v"
       context_window: 131072  # 128K
+    lite:
+      provider: "zhipu"
+      model: "glm-4.5-air"  # template/format tasks
     backup:
       provider: "groq"
       model: "llama-3.3-70b-versatile"

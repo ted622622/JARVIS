@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -68,7 +69,7 @@ class ModelRouter:
         self._consecutive_429: dict[str, int] = {}
         self._consecutive_5xx: dict[str, int] = {}
         self._provider_status: dict[str, ProviderStatus] = {
-            "zhipu_ceo": ProviderStatus.HEALTHY,   # zhipu for CEO chain (glm-4.5-air)
+            "zhipu_ceo": ProviderStatus.HEALTHY,   # zhipu for CEO chain (glm-4.6v / glm-4.5-air lite)
             "zhipu": ProviderStatus.HEALTHY,        # zhipu for VISION/IMAGE
             "groq": ProviderStatus.HEALTHY,
             "openrouter": ProviderStatus.HEALTHY,
@@ -94,14 +95,27 @@ class ModelRouter:
 
     # ── Public API ──────────────────────────────────────────────
 
-    def _get_chain_for_role(self, role: ModelRole) -> list[tuple[str, dict[str, Any]]]:
+    def select_model(self, task_type: str = "ceo") -> str:
+        """Select the appropriate Zhipu model based on task type.
+
+        - "template", "format", "cron_message": lightweight tasks → ZHIPU_LITE_MODEL
+        - Everything else (including "ceo"): full reasoning → ZHIPU_CEO_MODEL
+        """
+        if task_type in ("template", "format", "cron_message"):
+            return os.getenv("ZHIPU_LITE_MODEL", "glm-4.5-air")
+        return os.getenv("ZHIPU_CEO_MODEL", "glm-4.6v")
+
+    def _get_chain_for_role(
+        self, role: ModelRole, task_type: str = "ceo",
+    ) -> list[tuple[str, dict[str, Any]]]:
         """Return ordered provider chain for a given role.
 
         Each entry is (status_key, extra_kwargs) where status_key maps to
         _provider_status and _get_client_by_name.
         """
         if role == ModelRole.CEO:
-            chain = [("zhipu_ceo", {"model": "glm-4.5-air"})]
+            model = self.select_model(task_type)
+            chain = [("zhipu_ceo", {"model": model})]
             if self.groq is not None:
                 chain.append(("groq", {}))
             chain.append(("openrouter", {}))
@@ -117,10 +131,11 @@ class ModelRouter:
         messages: list[ChatMessage],
         *,
         role: ModelRole = ModelRole.CEO,
+        task_type: str = "ceo",
         **kwargs: Any,
     ) -> ChatResponse:
         """Send a chat request, automatically routing based on role with chain failover."""
-        chain = self._get_chain_for_role(role)
+        chain = self._get_chain_for_role(role, task_type=task_type)
         last_error = None
         tried_providers: list[str] = []
 

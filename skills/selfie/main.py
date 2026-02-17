@@ -20,13 +20,22 @@ Usage (as class):
 from __future__ import annotations
 
 import os
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
 
 from core.soul import CORE_DNA_PROMPT
+
+# Patch Q: Location keywords — if user specifies a location, skip auto-scene
+_LOCATION_PATTERN = re.compile(
+    r"在.{1,6}(?:邊|旁|裡|上|下|前|後|附近)|"
+    r"漢江|弘大|江南|明洞|梨泰院|咖啡廳|書店|屋頂|公園|海邊|"
+    r"辦公室|家裡|房間|地鐵站|餐廳|bar|cafe|rooftop|park|beach|office|room",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -40,6 +49,7 @@ class SelfieResult:
     success: bool = False
     error: str | None = None
     cost_usd: float = 0.0
+    queue_info: dict[str, Any] | None = None  # status_url, response_url for delayed check
 
 
 class SelfieSkill:
@@ -48,10 +58,11 @@ class SelfieSkill:
     Primary: fal.ai FLUX Kontext [pro] — uses reference image for consistency
     Backup: Google Gemini image generation (free tier)
     Verification: Vision model compares against anchor reference
+
+    Patch M: Single request (no retry) + queue API with delayed check.
     """
 
     CONSISTENCY_THRESHOLD = 0.6
-    MAX_RETRIES = 2
     COST_PER_IMAGE = 0.04  # USD for FLUX Kontext [pro]
 
     def __init__(
@@ -81,81 +92,90 @@ class SelfieSkill:
         scene: str,
         *,
         verify: bool = True,
+        persona: str = "clawra",
+        growth_content: str = "",
+        season: str | None = None,
     ) -> SelfieResult:
-        """Generate a Clawra selfie.
+        """Generate a Clawra selfie (single attempt, no retry).
 
         Args:
             scene: Scene description, e.g. "holding coffee, afternoon light"
             verify: Whether to run consistency check
+            persona: "clawra" or "jarvis" — affects delayed delivery caption
+            growth_content: raw SOUL_GROWTH.md for preference parsing (Patch Q)
+            season: override Seoul season (default: auto-detect)
 
         Returns:
             SelfieResult with image URL and metadata
         """
-        full_prompt = f"{CORE_DNA_PROMPT} {scene}"
-        result = SelfieResult()
+        # Patch Q: Randomize appearance (hairstyle + outfit + optional scene)
+        from core.appearance import AppearanceBuilder
 
-        for attempt in range(1, self.MAX_RETRIES + 2):
-            result.attempts = attempt
+        builder = AppearanceBuilder()
+        # Include auto-scene when user didn't specify a location
+        _has_user_location = bool(scene and _LOCATION_PATTERN.search(scene))
+        appearance = builder.build(
+            growth_content=growth_content,
+            season=season,
+            include_scene=not _has_user_location,
+        )
+        full_prompt = f"{CORE_DNA_PROMPT} {appearance}. {scene}"
+        logger.info(f"Selfie prompt appearance: {appearance[:80]}")
+        result = SelfieResult(attempts=1)
 
+        # 1. Try fal.ai queue (30s wait)
+        try:
+            img_response = await self._generate_via_fal_queued(full_prompt, max_wait=30.0)
+            result.image_url = img_response.url
+            result.width = img_response.width
+            result.height = img_response.height
+            result.cost_usd = self.COST_PER_IMAGE
+        except _FalQueueTimeout as e:
+            # fal accepted the job but didn't finish in 30s
+            result.error = "生成中，稍後補發"
+            result.queue_info = {
+                "status_url": e.status_url,
+                "response_url": e.response_url,
+                "persona": persona,
+            }
+            return result
+        except Exception as e:
+            logger.warning(f"fal.ai failed: {e}")
+            # Try Gemini backup
             try:
-                img_response = await self._generate_via_fal(full_prompt)
-                result.image_url = img_response.url
-                result.width = img_response.width
-                result.height = img_response.height
-                result.cost_usd = self.COST_PER_IMAGE
-            except Exception as e:
-                logger.warning(f"fal.ai generation failed (attempt {attempt}): {e}")
-                # Try Gemini backup
-                try:
-                    img_url = await self._generate_via_gemini(full_prompt)
-                    result.image_url = img_url
-                    result.cost_usd = 0.0  # Gemini free tier
-                except Exception as e2:
-                    logger.warning(f"Gemini backup also failed: {e2}")
-                    result.error = f"All generators failed: fal={e}, gemini={e2}"
-                    if attempt > self.MAX_RETRIES:
-                        return result
-                    continue
-
-            # Consistency check (optional)
-            if verify and self.router and result.image_url:
-                try:
-                    score = await self._check_consistency(result.image_url)
-                    result.consistency_score = score
-                    if score >= self.CONSISTENCY_THRESHOLD:
-                        result.success = True
-                        return result
-                    else:
-                        logger.warning(
-                            f"Consistency {score:.2f} < {self.CONSISTENCY_THRESHOLD}, "
-                            f"retry {attempt}/{self.MAX_RETRIES + 1}"
-                        )
-                        if attempt > self.MAX_RETRIES:
-                            result.error = f"Consistency too low: {score:.2f}"
-                            return result
-                        continue
-                except Exception as e:
-                    logger.warning(f"Consistency check error: {e}, accepting image")
-                    result.success = True
-                    return result
-            else:
-                result.success = True
+                img_url = await self._generate_via_gemini(full_prompt)
+                result.image_url = img_url
+                result.cost_usd = 0.0
+            except Exception as e2:
+                result.error = f"fal={e}, gemini={e2}"
                 return result
 
+        # Optional consistency check (single, no retry)
+        if verify and self.router and result.image_url:
+            try:
+                score = await self._check_consistency(result.image_url)
+                result.consistency_score = score
+            except Exception:
+                pass
+
+        result.success = True
         return result
 
-    async def _generate_via_fal(self, prompt: str):
-        """Generate image via fal.ai FLUX Kontext [pro]."""
+    async def _generate_via_fal_queued(self, prompt: str, max_wait: float = 30.0):
+        """Submit to fal.ai queue, poll up to max_wait seconds."""
         if not self._fal_key:
             raise ValueError("FAL_KEY not set")
 
-        fal = self._get_fal_client()
+        from clients.fal_client import FalQueueTimeoutError
 
+        fal = self._get_fal_client()
         kwargs: dict[str, Any] = {}
         if self._anchor_url:
             kwargs["image_url"] = self._anchor_url
-
-        return await fal.generate_image(prompt=prompt, **kwargs)
+        try:
+            return await fal.generate_image_queued(prompt=prompt, max_wait=max_wait, **kwargs)
+        except FalQueueTimeoutError as e:
+            raise _FalQueueTimeout(status_url=e.status_url, response_url=e.response_url) from e
 
     async def _generate_via_gemini(self, prompt: str) -> str:
         """Backup: generate image via Google Gemini."""
@@ -222,6 +242,18 @@ class SelfieSkill:
             return 0.5
 
 
+# ── Internal exception ────────────────────────────────────────────
+
+
+class _FalQueueTimeout(Exception):
+    """Internal: fal.ai queue job timed out but may still complete."""
+
+    def __init__(self, status_url: str = "", response_url: str = ""):
+        super().__init__("fal.ai queue timeout")
+        self.status_url = status_url
+        self.response_url = response_url
+
+
 # ── Skill entry point ────────────────────────────────────────────
 
 async def execute(scene: str = "casual selfie, natural light", **kwargs: Any) -> dict[str, Any]:
@@ -233,7 +265,13 @@ async def execute(scene: str = "casual selfie, natural light", **kwargs: Any) ->
         google_api_key=kwargs.get("google_api_key"),
     )
 
-    result = await skill.generate(scene, verify=kwargs.get("verify", False))
+    result = await skill.generate(
+        scene,
+        verify=kwargs.get("verify", False),
+        persona=kwargs.get("persona", "clawra"),
+        growth_content=kwargs.get("growth_content", ""),
+        season=kwargs.get("season"),
+    )
 
     return {
         "image_url": result.image_url,
@@ -244,4 +282,5 @@ async def execute(scene: str = "casual selfie, natural light", **kwargs: Any) ->
         "success": result.success,
         "cost_usd": result.cost_usd,
         "error": result.error,
+        "queue_info": result.queue_info,
     }

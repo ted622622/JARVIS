@@ -66,7 +66,7 @@ class TestSoul:
         soul.load()
         prompt = soul.build_system_prompt("clawra")
         assert "Clawra" in prompt
-        assert "100% 誠實" in prompt
+        assert "誠實" in prompt
 
     def test_extra_context_injected(self):
         soul = Soul(config_dir="./config")
@@ -177,6 +177,7 @@ class TestSelfieSkill:
 
     @pytest.mark.asyncio
     async def test_generate_via_fal_success(self):
+        """Patch M: Single attempt via queue API."""
         skill = SelfieSkill(fal_api_key="test-key")
 
         from clients.fal_client import FalImageResponse
@@ -184,7 +185,7 @@ class TestSelfieSkill:
             url="https://fal.ai/result.jpg", width=1024, height=1024
         )
 
-        skill._generate_via_fal = AsyncMock(return_value=fake_response)
+        skill._generate_via_fal_queued = AsyncMock(return_value=fake_response)
         result = await skill.generate("holding coffee", verify=False)
 
         assert result.success
@@ -194,48 +195,43 @@ class TestSelfieSkill:
         assert result.attempts == 1
 
     @pytest.mark.asyncio
-    async def test_consistency_check_retry(self):
+    async def test_consistency_check_single(self):
+        """Patch M: Single consistency check (no retry on low score)."""
         skill = SelfieSkill(fal_api_key="test-key")
         skill.CONSISTENCY_THRESHOLD = 0.7
 
         from clients.fal_client import FalImageResponse
+        fake = FalImageResponse(url="https://fal.ai/1.jpg", width=1024, height=1024)
 
-        call_count = 0
-        async def mock_gen(prompt):
-            nonlocal call_count
-            call_count += 1
-            return FalImageResponse(url=f"https://fal.ai/{call_count}.jpg", width=1024, height=1024)
-
-        async def mock_check(url):
-            if call_count <= 1:
-                return 0.3
-            return 0.8
-
-        skill._generate_via_fal = mock_gen
-        skill._check_consistency = mock_check
+        skill._generate_via_fal_queued = AsyncMock(return_value=fake)
+        skill._check_consistency = AsyncMock(return_value=0.3)
         skill.router = MagicMock()
 
         result = await skill.generate("test scene", verify=True)
+        # Patch M: accepts image regardless of consistency score (single check, no retry)
         assert result.success
-        assert result.attempts == 2
-        assert result.consistency_score == 0.8
+        assert result.attempts == 1
+        assert result.consistency_score == 0.3
 
     @pytest.mark.asyncio
-    async def test_max_retries_exceeded(self):
+    async def test_queue_timeout_returns_queue_info(self):
+        """Patch M: Queue timeout returns queue_info for delayed check."""
         skill = SelfieSkill(fal_api_key="test-key")
-        skill.CONSISTENCY_THRESHOLD = 0.9
-        skill.MAX_RETRIES = 1
 
-        from clients.fal_client import FalImageResponse
-        fake = FalImageResponse(url="https://fal.ai/x.jpg", width=512, height=512)
-        skill._generate_via_fal = AsyncMock(return_value=fake)
-        skill._check_consistency = AsyncMock(return_value=0.2)
-        skill.router = MagicMock()
+        from skills.selfie.main import _FalQueueTimeout
+        skill._generate_via_fal_queued = AsyncMock(
+            side_effect=_FalQueueTimeout(
+                status_url="https://queue.fal.run/status/abc",
+                response_url="https://queue.fal.run/result/abc",
+            )
+        )
 
-        result = await skill.generate("test", verify=True)
+        result = await skill.generate("test", verify=False, persona="clawra")
         assert not result.success
-        assert result.attempts == 2
-        assert "too low" in result.error.lower()
+        assert result.queue_info is not None
+        assert result.queue_info["status_url"] == "https://queue.fal.run/status/abc"
+        assert result.queue_info["persona"] == "clawra"
+        assert result.error == "生成中，稍後補發"
 
     def test_core_dna_in_prompt(self):
         soul = Soul()

@@ -83,6 +83,9 @@ class TelegramClient:
         # Map bot token → persona for incoming message routing
         self._token_to_persona: dict[str, str] = {}
 
+        # Patch O: CEO reference for complexity estimation
+        self._ceo_ref = None
+
         # Voice components (injected after init)
         self._voice_worker = None
         self._stt_client = None
@@ -127,6 +130,10 @@ class TelegramClient:
     @transcribe_worker.setter
     def transcribe_worker(self, worker) -> None:
         self._transcribe_worker = worker
+
+    def set_ceo_ref(self, ceo) -> None:
+        """Set reference to CEO agent for task complexity estimation."""
+        self._ceo_ref = ceo
 
     def _get_bot(self, persona: str = "jarvis") -> Bot | None:
         if persona == "clawra" and self._clawra_bot:
@@ -357,6 +364,14 @@ class TelegramClient:
             await asyncio.sleep(wait)
             elapsed += wait
 
+    async def _send_long_text(self, update: Update, text: str) -> None:
+        """Split long replies into <=4000-char chunks for Telegram."""
+        if len(text) > 4000:
+            for i in range(0, len(text), 4000):
+                await update.message.reply_text(text[i:i + 4000])
+        else:
+            await update.message.reply_text(text)
+
     async def _handle_text_message(self, update: Update, context: Any) -> None:
         """Process incoming text messages from users."""
         if not update.message or not update.message.text:
@@ -382,6 +397,20 @@ class TelegramClient:
             await update.message.reply_text("收到，但 CEO Agent 尚未就緒。")
             return
 
+        # ── Patch O: Long-task acknowledgement ──────────────────
+        if self._ceo_ref and hasattr(self._ceo_ref, "estimate_complexity"):
+            try:
+                complexity = self._ceo_ref.estimate_complexity(user_text)
+                if complexity["is_long"]:
+                    est = complexity["estimate_seconds"]
+                    if persona == "clawra":
+                        ack = f"欸收到！讓我看看...大概要等個 {est} 秒左右喔～"
+                    else:
+                        ack = f"收到，正在處理中。預計需要 {est} 秒。"
+                    await update.message.reply_text(ack)
+            except Exception as e:
+                logger.debug(f"Complexity estimation failed: {e}")
+
         try:
             reply = await self._on_message(user_text, chat_id, persona)
 
@@ -389,6 +418,13 @@ class TelegramClient:
             if persona == "clawra":
                 reply_text = reply.get("text", "") if isinstance(reply, dict) else (reply or "")
                 await self._simulate_typing(context.bot, chat_id, reply_text)
+
+            # Patch O: friendly fallback for empty replies
+            _empty_fallback = (
+                "嗯...我想了一下但不太確定怎麼回，你可以換個方式問問看嗎～"
+                if persona == "clawra"
+                else "Sir, 我已處理完成，但未能產生有效回覆。請換個方式描述您的需求。"
+            )
 
             if isinstance(reply, dict):
                 # Rich reply — may include photo, phone, booking_url
@@ -401,16 +437,16 @@ class TelegramClient:
                         await update.message.reply_photo(photo=photo_url, caption=text or None)
                     except Exception as e:
                         logger.warning(f"Failed to send photo, sending as text: {e}")
-                        await update.message.reply_text(text or "（無回覆）")
+                        await self._send_long_text(update, text or _empty_fallback)
                 else:
-                    await update.message.reply_text(text or "（無回覆）")
+                    await self._send_long_text(update, text or _empty_fallback)
                 # K3: Send phone number as separate message (TG auto-detects clickable phone)
                 if phone:
                     await self.send(phone, persona=persona, chat_id=chat_id)
                 if booking_url:
                     await self.send(booking_url, persona=persona, chat_id=chat_id)
             else:
-                await update.message.reply_text(reply or "（無回覆）")
+                await self._send_long_text(update, reply or _empty_fallback)
         except Exception as e:
             logger.error(f"[{persona}] Message handler error: {e}")
             if persona == "clawra":

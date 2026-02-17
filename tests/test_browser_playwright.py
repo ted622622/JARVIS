@@ -661,7 +661,7 @@ class TestBookingIntegration:
         mock_response.content = "好的，我幫你找到了滿築火鍋的資訊，電話已經附上囉！"
         router.chat = AsyncMock(return_value=mock_response)
 
-        # Mock browser with Maps
+        # Mock browser with Maps — no booking_url, no web booking found
         mock_browser = AsyncMock()
         mock_browser.fetch_url = AsyncMock()
         mock_browser.search_google_maps = AsyncMock(return_value={
@@ -671,6 +671,10 @@ class TestBookingIntegration:
             "rating": "4.5",
             "booking_url": None,
             "worker": "browser",
+        })
+        mock_browser.find_booking_url = AsyncMock(return_value=None)
+        mock_browser.complete_booking = AsyncMock(return_value={
+            "error": "no_booking_url", "worker": "browser",
         })
 
         # Setup CEO
@@ -683,7 +687,7 @@ class TestBookingIntegration:
 
         result = await ceo.handle_message("幫我訂明天晚上6點的滿築火鍋五個人")
 
-        # Should return dict with phone
+        # Should return dict with phone (no booking_url, so goes through LLM)
         assert isinstance(result, dict)
         assert result["phone"] == "02-1234-5678"
         assert "text" in result
@@ -725,3 +729,105 @@ class TestBookingIntegration:
         assert isinstance(result, dict)
         assert result["booking_url"] == "https://booking.example.com"
         assert result["phone"] == "02-9999-0000"
+        # Short-circuit: reply assembled directly, not from LLM
+        assert "好餐廳" in result["text"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Playwright availability cache tests
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestPlaywrightAvailabilityCache:
+    """Tests for _pw_available cache to avoid 20-second retry waste."""
+
+    def _make_worker(self):
+        from workers.browser_worker import BrowserWorker
+        return BrowserWorker(security_gate=None, user_data_dir="./data/test_chrome")
+
+    @pytest.mark.asyncio
+    async def test_pw_available_initially_none(self):
+        """_pw_available starts as None (unknown)."""
+        worker = self._make_worker()
+        assert worker._pw_available is None
+
+    @pytest.mark.asyncio
+    async def test_pw_available_set_false_after_failure(self):
+        """After _ensure_context fails 10 times, _pw_available is set to False."""
+        import workers.browser_worker as bw
+        worker = self._make_worker()
+
+        mock_pw = AsyncMock()
+        # All connect_over_cdp calls fail
+        mock_pw.chromium.connect_over_cdp = AsyncMock(
+            side_effect=Exception("Connection refused")
+        )
+
+        mock_asp = MagicMock()
+        mock_asp.return_value.start = AsyncMock(return_value=mock_pw)
+
+        original = getattr(bw, "async_playwright", None)
+        bw.async_playwright = mock_asp
+        try:
+            with (
+                patch.object(bw, "_HAS_PLAYWRIGHT", True),
+                patch("subprocess.run"),
+                patch("subprocess.Popen"),
+                patch("asyncio.sleep", new_callable=AsyncMock),
+            ):
+                with pytest.raises(RuntimeError, match="Failed to connect"):
+                    await worker._ensure_context()
+                assert worker._pw_available is False
+        finally:
+            if original is not None:
+                bw.async_playwright = original
+            elif hasattr(bw, "async_playwright"):
+                delattr(bw, "async_playwright")
+
+    @pytest.mark.asyncio
+    async def test_pw_available_false_skips_immediately(self):
+        """When _pw_available is False, _ensure_context raises immediately."""
+        worker = self._make_worker()
+        worker._pw_available = False
+
+        with patch("workers.browser_worker._HAS_PLAYWRIGHT", True):
+            with pytest.raises(RuntimeError, match="previously failed"):
+                await worker._ensure_context()
+
+    @pytest.mark.asyncio
+    async def test_search_google_maps_returns_error_when_cached_fail(self):
+        """search_google_maps returns error dict when Playwright cached as failed."""
+        worker = self._make_worker()
+        worker._pw_available = False
+
+        with patch("workers.browser_worker._HAS_PLAYWRIGHT", True):
+            result = await worker.search_google_maps("任何餐廳")
+            assert "error" in result
+            assert "previously failed" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_pw_available_set_true_on_success(self):
+        """_pw_available is set to True on successful CDP connection."""
+        import workers.browser_worker as bw
+        worker = self._make_worker()
+
+        mock_pw = AsyncMock()
+        mock_browser = MagicMock()
+        mock_context = AsyncMock()
+        mock_browser.contexts = [mock_context]
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_browser)
+
+        mock_asp = MagicMock()
+        mock_asp.return_value.start = AsyncMock(return_value=mock_pw)
+
+        original = getattr(bw, "async_playwright", None)
+        bw.async_playwright = mock_asp
+        try:
+            with patch.object(bw, "_HAS_PLAYWRIGHT", True):
+                await worker._ensure_context()
+                assert worker._pw_available is True
+        finally:
+            if original is not None:
+                bw.async_playwright = original
+            elif hasattr(bw, "async_playwright"):
+                delattr(bw, "async_playwright")

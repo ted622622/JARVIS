@@ -40,9 +40,55 @@ _CLAWRA_LEARN_PATTERNS = re.compile(
     r"以後|不要再|記住|喜歡|不喜歡|習慣|"
     r"太煩了|太黏了|不要這樣|別這樣|"
     r"不要問|不用|不需要|"
-    r"好啦|知道了|夠了",
+    r"好啦|知道了|夠了|"
+    r"髮型|頭髮|好看|穿搭|衣服|場景",
     re.IGNORECASE,
 )
+
+# Selfie appearance feedback — positive or negative
+_SELFIE_APPEARANCE_PATTERN = re.compile(
+    r"(?P<sentiment>好看|喜歡|不錯|讚|可愛|好喜歡|超好看|不喜歡|不好看|太奇怪|不要|醜|怪怪的)"
+    r".*?"
+    r"(?P<category>髮型|頭髮|馬尾|捲髮|包包頭|辮子|雙馬尾|半綁|"
+    r"穿搭|衣服|外套|裙子|洋裝|大衣|帽子|"
+    r"場景|背景|咖啡廳|漢江|弘大|書店|屋頂)"
+    r"|"
+    r"(?P<category2>髮型|頭髮|馬尾|捲髮|包包頭|辮子|雙馬尾|半綁|"
+    r"穿搭|衣服|外套|裙子|洋裝|大衣|帽子|"
+    r"場景|背景|咖啡廳|漢江|弘大|書店|屋頂)"
+    r".*?"
+    r"(?P<sentiment2>好看|喜歡|不錯|讚|可愛|好喜歡|超好看|不喜歡|不好看|太奇怪|不要|醜|怪怪的)",
+    re.IGNORECASE,
+)
+
+# Map Chinese keywords → English pref values for [selfie-pref] tags
+_CATEGORY_MAP: dict[str, tuple[str, str]] = {
+    # (english_category, english_value)
+    "髮型": ("hairstyle", ""),
+    "頭髮": ("hairstyle", ""),
+    "馬尾": ("hairstyle", "ponytail"),
+    "捲髮": ("hairstyle", "curly"),
+    "包包頭": ("hairstyle", "bun"),
+    "辮子": ("hairstyle", "braided"),
+    "雙馬尾": ("hairstyle", "twintails"),
+    "半綁": ("hairstyle", "half-up"),
+    "穿搭": ("outfit", ""),
+    "衣服": ("outfit", ""),
+    "外套": ("outfit", "coat"),
+    "裙子": ("outfit", "skirt"),
+    "洋裝": ("outfit", "dress"),
+    "大衣": ("outfit", "coat"),
+    "帽子": ("outfit", "beanie"),
+    "場景": ("scene", ""),
+    "背景": ("scene", ""),
+    "咖啡廳": ("scene", "cafe"),
+    "漢江": ("scene", "Han River"),
+    "弘大": ("scene", "Hongdae"),
+    "書店": ("scene", "bookstore"),
+    "屋頂": ("scene", "rooftop"),
+}
+
+_NEGATIVE_SENTIMENTS = frozenset({"不喜歡", "不好看", "太奇怪", "不要", "醜", "怪怪的"})
 
 # Core values that GROWTH must never contradict
 _CORE_PRINCIPLES = [
@@ -116,11 +162,44 @@ class SoulGrowth:
         logger.info(f"SoulGrowth [{persona}]: learned — {insight[:60]}")
         return insight
 
+    def _extract_selfie_preference(self, user_msg: str) -> str | None:
+        """Extract selfie appearance feedback as a [selfie-pref] tag.
+
+        Returns e.g. "- [selfie-pref] like:hairstyle:ponytail"
+        """
+        match = _SELFIE_APPEARANCE_PATTERN.search(user_msg)
+        if not match:
+            return None
+
+        # Determine sentiment and category from either ordering
+        sentiment = match.group("sentiment") or match.group("sentiment2")
+        category_zh = match.group("category") or match.group("category2")
+        if not sentiment or not category_zh:
+            return None
+
+        mapping = _CATEGORY_MAP.get(category_zh)
+        if not mapping:
+            return None
+
+        eng_category, eng_value = mapping
+        if not eng_value:
+            # Generic category without specific value — skip
+            return None
+
+        like_or_dislike = "dislike" if sentiment in _NEGATIVE_SENTIMENTS else "like"
+        return f"- [selfie-pref] {like_or_dislike}:{eng_category}:{eng_value}"
+
     def _extract_insight(
         self, persona: str, user_msg: str, assistant_msg: str,
     ) -> str | None:
         """Extract a concise preference insight from conversation."""
         msg = user_msg.strip()
+
+        # Patch Q: Check selfie appearance preference first (Clawra only)
+        if persona == "clawra":
+            selfie_pref = self._extract_selfie_preference(msg)
+            if selfie_pref:
+                return selfie_pref
 
         # Direct preference statements
         for prefix in ["以後", "記住", "不要再"]:

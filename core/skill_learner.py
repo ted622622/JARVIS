@@ -280,6 +280,7 @@ class SkillLearner:
         response = await self.router.chat(
             [ChatMessage(role="user", content=prompt)],
             role=ModelRole.CEO,
+            task_type="template",
             max_tokens=200,
         )
         return response.content

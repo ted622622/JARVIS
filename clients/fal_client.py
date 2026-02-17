@@ -161,7 +161,11 @@ class FalClient:
             elif status.get("status") == "FAILED":
                 raise FalGenerationError(f"fal.ai job failed: {status}")
         else:
-            raise FalGenerationError(f"fal.ai job timed out after {max_wait}s")
+            raise FalQueueTimeoutError(
+                f"fal.ai job timed out after {max_wait}s",
+                status_url=status_url,
+                response_url=response_url,
+            )
 
         # Fetch result
         result_resp = await client.get(response_url)
@@ -172,6 +176,32 @@ class FalClient:
         if not images:
             raise FalGenerationError("fal.ai returned no images after queue completion")
 
+        img = images[0]
+        return FalImageResponse(
+            url=img["url"],
+            width=img.get("width", 0),
+            height=img.get("height", 0),
+            content_type=img.get("content_type", "image/jpeg"),
+            seed=data.get("seed", 0),
+            raw=data,
+        )
+
+    async def check_queue_status(self, status_url: str) -> str:
+        """Check queue job status. Returns: 'COMPLETED', 'FAILED', 'IN_QUEUE', 'IN_PROGRESS'."""
+        client = await self._get_client()
+        resp = await client.get(status_url, timeout=10.0)
+        resp.raise_for_status()
+        return resp.json().get("status", "UNKNOWN")
+
+    async def fetch_queue_result(self, response_url: str) -> FalImageResponse:
+        """Fetch completed queue result."""
+        client = await self._get_client()
+        resp = await client.get(response_url, timeout=30.0)
+        resp.raise_for_status()
+        data = resp.json()
+        images = data.get("images", [])
+        if not images:
+            raise FalGenerationError("No images in queue result")
         img = images[0]
         return FalImageResponse(
             url=img["url"],
@@ -207,3 +237,12 @@ class FalClient:
 
 class FalGenerationError(Exception):
     """Raised when fal.ai image generation fails."""
+
+
+class FalQueueTimeoutError(FalGenerationError):
+    """Raised when queue job doesn't complete within max_wait."""
+
+    def __init__(self, msg: str, status_url: str = "", response_url: str = ""):
+        super().__init__(msg)
+        self.status_url = status_url
+        self.response_url = response_url

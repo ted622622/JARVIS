@@ -310,6 +310,9 @@ async def main() -> None:
     ceo._shared_memory = shared_memory
     logger.info("  [8e/12] Patch J modules initialized (SoulGrowth, SharedMemory, SoulGuard)")
 
+    # Patch O: Inject CEO ref for long-task acknowledgement
+    telegram.set_ceo_ref(ceo)
+
     # Inject voice + transcribe workers into Telegram client
     telegram.voice_worker = voice_worker
     telegram.transcribe_worker = transcribe_worker
@@ -375,6 +378,7 @@ async def main() -> None:
         react_executor=react_exec,
         gog_worker=gog_worker if gog_worker.is_available else None,
         reminder_manager=reminder_mgr,
+        fal_client=fal_client,
     )
     heartbeat.start()
 

@@ -440,3 +440,384 @@ class TestCEOReactIntegration:
 
         result = await ceo_with_react.handle_message("幫我查今天天氣")
         assert result is not None  # Should get some response
+
+
+# ── Patch M: Selfie Scene + Pending Tests ────────────────────────
+
+
+class TestSelfieSceneAndPending:
+    """Test that CEO passes scene=user_message and saves pending selfies."""
+
+    @pytest.mark.asyncio
+    async def test_skill_invoke_passes_scene(self, mock_router, mock_soul, mock_emotion, mock_memos):
+        """skills.invoke should be called with scene=user_message."""
+        reg = MagicMock()
+
+        mock_meta = MagicMock()
+        mock_meta.name = "selfie"
+        mock_meta.description = "自拍"
+        reg.list_all.return_value = [mock_meta]
+        reg.get.return_value = mock_meta
+        reg.invoke = AsyncMock(return_value={
+            "image_url": "https://fal.ai/test.jpg",
+            "success": True,
+        })
+
+        # Make the router return "SKILL:selfie" for the judge prompt
+        mock_router.chat.side_effect = [
+            ChatResponse(content="SKILL:selfie", model="test", usage={}),
+            ChatResponse(content="看我的自拍～", model="test", usage={}),
+        ]
+
+        ceo = CEOAgent(
+            model_router=mock_router,
+            soul=mock_soul,
+            emotion_classifier=mock_emotion,
+            memos=mock_memos,
+            skill_registry=reg,
+        )
+        result = await ceo.handle_message("幫我拍一張自拍")
+
+        # Verify scene=user_message was passed (Patch Q: also passes growth_content)
+        reg.invoke.assert_called_once()
+        call_args = reg.invoke.call_args
+        assert call_args[0] == ("selfie",)
+        assert call_args[1]["scene"] == "幫我拍一張自拍"
+        assert "growth_content" in call_args[1]
+
+    @pytest.mark.asyncio
+    async def test_pending_selfie_saved_on_queue_info(self, mock_router, mock_soul, mock_emotion, mock_memos, tmp_path):
+        """When skill returns queue_info, CEO saves pending selfie."""
+        reg = MagicMock()
+        mock_meta = MagicMock()
+        mock_meta.name = "selfie"
+        mock_meta.description = "自拍"
+        reg.list_all.return_value = [mock_meta]
+        reg.get.return_value = mock_meta
+        reg.invoke = AsyncMock(return_value={
+            "image_url": None,
+            "success": False,
+            "error": "生成中，稍後補發",
+            "queue_info": {
+                "status_url": "https://queue.fal.run/status/abc",
+                "response_url": "https://queue.fal.run/result/abc",
+                "persona": "clawra",
+            },
+        })
+
+        mock_router.chat.side_effect = [
+            ChatResponse(content="SKILL:selfie", model="test", usage={}),
+            ChatResponse(content="等等喔～", model="test", usage={}),
+        ]
+
+        ceo = CEOAgent(
+            model_router=mock_router,
+            soul=mock_soul,
+            emotion_classifier=mock_emotion,
+            memos=mock_memos,
+            skill_registry=reg,
+        )
+        # Override the pending selfie path to tmp_path
+        ceo.PENDING_SELFIE_PATH = tmp_path / "pending_selfies.json"
+
+        result = await ceo.handle_message("拍個自拍")
+
+        # Should have saved pending selfie
+        import json
+        assert ceo.PENDING_SELFIE_PATH.exists()
+        entries = json.loads(ceo.PENDING_SELFIE_PATH.read_text(encoding="utf-8"))
+        assert len(entries) == 1
+        assert entries[0]["status_url"] == "https://queue.fal.run/status/abc"
+        assert entries[0]["status"] == "pending"
+        assert entries[0]["persona"] == "clawra"
+
+        # Should have set the selfie-specific excuse hint
+        # (result is from the second chat call since _try_skill_match returns None)
+        assert result == "等等喔～"
+
+    @pytest.mark.asyncio
+    async def test_pending_selfie_max_limit(self, tmp_path):
+        """Only keeps MAX_PENDING_SELFIES entries."""
+        import json
+
+        ceo = CEOAgent(model_router=AsyncMock())
+        ceo.PENDING_SELFIE_PATH = tmp_path / "pending_selfies.json"
+
+        # Save more than MAX
+        for i in range(ceo.MAX_PENDING_SELFIES + 3):
+            ceo._save_pending_selfie({
+                "status_url": f"https://queue.fal.run/status/{i}",
+                "response_url": f"https://queue.fal.run/result/{i}",
+                "persona": "clawra",
+            })
+
+        entries = json.loads(ceo.PENDING_SELFIE_PATH.read_text(encoding="utf-8"))
+        assert len(entries) == ceo.MAX_PENDING_SELFIES
+
+    def test_load_pending_selfies_empty(self, tmp_path):
+        """Load from non-existent file returns empty list."""
+        ceo = CEOAgent(model_router=AsyncMock())
+        ceo.PENDING_SELFIE_PATH = tmp_path / "nonexistent.json"
+        assert ceo._load_pending_selfies() == []
+
+    def test_load_pending_selfies_corrupt(self, tmp_path):
+        """Corrupt JSON returns empty list."""
+        ceo = CEOAgent(model_router=AsyncMock())
+        corrupt_file = tmp_path / "bad.json"
+        corrupt_file.write_text("not json!", encoding="utf-8")
+        ceo.PENDING_SELFIE_PATH = corrupt_file
+        assert ceo._load_pending_selfies() == []
+
+
+# ── Patch O: Complexity Estimation Tests ──────────────────────────
+
+
+class TestEstimateComplexity:
+    """Test CEO.estimate_complexity() for long-task detection."""
+
+    @pytest.fixture
+    def ceo_simple(self):
+        return CEOAgent(model_router=AsyncMock())
+
+    def test_simple_greeting_not_long(self, ceo_simple):
+        """Simple greeting → is_long=False."""
+        result = ceo_simple.estimate_complexity("你好")
+        assert result["is_long"] is False
+        assert result["estimate_seconds"] == 5
+
+    def test_url_detected_as_long(self, ceo_simple):
+        """Message with URL → is_long=True, reason=web_task."""
+        result = ceo_simple.estimate_complexity("幫我看 https://github.com/repo")
+        assert result["is_long"] is True
+        assert result["reason"] == "web_task"
+        assert result["estimate_seconds"] == 45
+
+    def test_web_search_keyword_long(self, ceo_simple):
+        """Web search keywords → is_long=True."""
+        result = ceo_simple.estimate_complexity("幫我查比特幣現在多少")
+        assert result["is_long"] is True
+        assert result["reason"] == "web_task"
+
+    def test_booking_keyword_long(self, ceo_simple):
+        """Booking intent → is_long=True."""
+        result = ceo_simple.estimate_complexity("幫我訂明天晚上的餐廳")
+        assert result["is_long"] is True
+        assert result["reason"] == "web_task"
+
+    def test_code_keyword_long(self, ceo_simple):
+        """Code task → is_long=True."""
+        result = ceo_simple.estimate_complexity("幫我寫一個程式")
+        assert result["is_long"] is True
+        assert result["reason"] == "web_task"
+
+    def test_long_text_detected(self, ceo_simple):
+        """Message over 300 chars → is_long=True, reason=complex_instruction."""
+        long_msg = "這是一段很長的指令。" * 40  # 400 chars
+        result = ceo_simple.estimate_complexity(long_msg)
+        assert result["is_long"] is True
+        assert result["reason"] == "complex_instruction"
+        assert result["estimate_seconds"] == 30
+
+    def test_short_question_not_long(self, ceo_simple):
+        """Short factual question → is_long=False."""
+        result = ceo_simple.estimate_complexity("什麼是 Python？")
+        assert result["is_long"] is False
+
+
+# ── Patch O: Empty Reply Guard Tests ─────────────────────────────
+
+
+class TestEmptyReplyGuard:
+    """Test that CEO returns a friendly fallback instead of empty string."""
+
+    @pytest.fixture
+    def ceo_with_browser(self, mock_router, mock_soul, mock_emotion, mock_memos, mock_registry):
+        mock_browser = AsyncMock()
+        mock_browser.name = "browser"
+        mock_browser.fetch_url.return_value = {"content": "some page content"}
+        mock_browser.execute.return_value = {
+            "content": "some page content", "worker": "browser",
+        }
+        return CEOAgent(
+            model_router=mock_router,
+            soul=mock_soul,
+            emotion_classifier=mock_emotion,
+            memos=mock_memos,
+            skill_registry=mock_registry,
+            workers={"browser": mock_browser},
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_reply_returns_fallback_jarvis(self, mock_router, mock_soul, mock_emotion, mock_memos, mock_registry):
+        """Empty LLM reply → friendly fallback for JARVIS."""
+        mock_router.chat.return_value = ChatResponse(
+            content="", model="test", usage={},
+        )
+        ceo = CEOAgent(
+            model_router=mock_router,
+            soul=mock_soul,
+            emotion_classifier=mock_emotion,
+            memos=mock_memos,
+            skill_registry=mock_registry,
+        )
+        result = await ceo.handle_message("測試空回覆")
+        assert result  # not empty
+        assert "Sir" in result
+
+    @pytest.mark.asyncio
+    async def test_empty_reply_returns_fallback_clawra(self, mock_router, mock_soul, mock_emotion, mock_memos, mock_registry):
+        """Empty LLM reply → friendly fallback for Clawra."""
+        mock_router.chat.return_value = ChatResponse(
+            content="", model="test", usage={},
+        )
+        ceo = CEOAgent(
+            model_router=mock_router,
+            soul=mock_soul,
+            emotion_classifier=mock_emotion,
+            memos=mock_memos,
+            skill_registry=mock_registry,
+        )
+        result = await ceo.handle_message("測試空回覆", persona="clawra")
+        assert result
+        assert "再問一次" in result
+
+    @pytest.mark.asyncio
+    async def test_tool_use_followup_gets_higher_max_tokens(self, ceo_with_browser, mock_router):
+        """When tool-use triggers a followup call, max_tokens should be 4096."""
+        # First call returns [FETCH:url], second call returns final reply
+        mock_router.chat.side_effect = [
+            ChatResponse(content="[FETCH:https://example.com]", model="test", usage={}),
+            ChatResponse(content="這是結果", model="test", usage={}),
+        ]
+        result = await ceo_with_browser.handle_message("幫我看 https://example.com")
+        # Verify the second chat call used max_tokens=4096
+        second_call = mock_router.chat.call_args_list[-1]
+        assert second_call.kwargs.get("max_tokens") == 4096
+
+
+# ── Booking Fallback Tests (Maps failure → httpx fallback) ────────
+
+
+class TestBookingFallbackWhenMapsFails:
+    """Test that booking flow degrades to find_booking_url() when Maps fails."""
+
+    @pytest.mark.asyncio
+    async def test_booking_fallback_when_maps_fails(self):
+        """Maps returns error → find_booking_url() is called."""
+        from core.ceo_agent import CEOAgent
+        from clients.base_client import ChatResponse
+
+        router = MagicMock()
+        router.chat = AsyncMock(return_value=ChatResponse(
+            content="幫你查到了！", model="test", usage={},
+        ))
+
+        mock_browser = AsyncMock()
+        mock_browser.fetch_url = AsyncMock()
+        mock_browser.search_google_maps = AsyncMock(return_value={
+            "error": "Failed to connect to Chrome after 10 attempts",
+            "worker": "browser",
+        })
+        mock_browser.find_booking_url = AsyncMock(return_value="https://inline.app/booking/test")
+
+        ceo = CEOAgent(model_router=router)
+        ceo.workers = {"browser": mock_browser}
+        ceo.memos = None
+        ceo.md_memory = None
+        ceo.emotion = None
+        ceo.skills = None
+
+        result = await ceo.handle_message("幫我訂滿足火鍋")
+
+        mock_browser.find_booking_url.assert_called_once()
+        assert isinstance(result, dict)
+        assert result.get("booking_url") == "https://inline.app/booking/test"
+        # text comes from LLM, booking_url is attached by CEO
+        assert "text" in result
+
+    @pytest.mark.asyncio
+    async def test_booking_fallback_finds_url(self):
+        """Fallback finds inline.app URL → correct dict returned."""
+        from core.ceo_agent import CEOAgent
+
+        ceo = CEOAgent(model_router=MagicMock())
+
+        mock_browser = AsyncMock()
+        mock_browser.fetch_url = AsyncMock()
+        mock_browser.search_google_maps = AsyncMock(return_value={
+            "error": "Playwright previously failed, skipping",
+            "worker": "browser",
+        })
+        mock_browser.find_booking_url = AsyncMock(
+            return_value="https://inline.app/booking/awesome-restaurant"
+        )
+        ceo.workers = {"browser": mock_browser}
+
+        result = await ceo._proactive_web_search("幫我訂好棒棒餐廳")
+
+        assert isinstance(result, dict)
+        assert result["booking_url"] == "https://inline.app/booking/awesome-restaurant"
+        assert "好棒棒餐廳" in result["text"]
+
+    @pytest.mark.asyncio
+    async def test_booking_fallback_no_url_no_crash(self):
+        """Fallback also finds nothing → falls through without crash."""
+        from core.ceo_agent import CEOAgent
+
+        ceo = CEOAgent(model_router=MagicMock())
+
+        mock_browser = AsyncMock()
+        mock_browser.fetch_url = AsyncMock()
+        mock_browser.search_google_maps = AsyncMock(return_value={
+            "error": "Playwright previously failed, skipping",
+            "worker": "browser",
+        })
+        mock_browser.find_booking_url = AsyncMock(return_value=None)
+        ceo.workers = {"browser": mock_browser}
+
+        # Should not crash, should fall through to DuckDuckGo search
+        result = await ceo._proactive_web_search("幫我訂不存在的餐廳")
+        # Result could be None or a DDG search result; either way no exception
+        mock_browser.find_booking_url.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_maps_tool_fallback(self):
+        """[MAPS:query] tag fails → fallback provides booking URL."""
+        from core.ceo_agent import CEOAgent
+
+        ceo = CEOAgent(model_router=MagicMock())
+
+        mock_browser = AsyncMock()
+        mock_browser.search_google_maps = AsyncMock(return_value={
+            "error": "Failed to connect to Chrome after 10 attempts",
+            "worker": "browser",
+        })
+        mock_browser.find_booking_url = AsyncMock(
+            return_value="https://eztable.com/restaurant/123"
+        )
+        ceo.workers = {"browser": mock_browser}
+
+        result = await ceo._execute_tool_call("滿足火鍋", tag="MAPS")
+
+        mock_browser.find_booking_url.assert_called_once_with("滿足火鍋")
+        assert "eztable.com" in result
+        assert "訂位連結" in result
+
+    @pytest.mark.asyncio
+    async def test_maps_tool_fallback_no_url(self):
+        """[MAPS:query] fails and no booking URL → error message returned."""
+        from core.ceo_agent import CEOAgent
+
+        ceo = CEOAgent(model_router=MagicMock())
+
+        mock_browser = AsyncMock()
+        mock_browser.search_google_maps = AsyncMock(return_value={
+            "error": "Playwright previously failed, skipping",
+            "worker": "browser",
+        })
+        mock_browser.find_booking_url = AsyncMock(return_value=None)
+        ceo.workers = {"browser": mock_browser}
+
+        result = await ceo._execute_tool_call("隨便餐廳", tag="MAPS")
+
+        assert "搜尋失敗" in result
