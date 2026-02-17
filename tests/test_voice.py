@@ -617,6 +617,142 @@ class TestTelegramVoiceHandler:
             await client._handle_voice_message(update, context)
             mock_typing.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_force_text_reply_when_user_requests(self, tmp_path):
+        """If user says '用文字回我' in voice, should reply with text, not TTS."""
+        client = self._make_client()
+        client._voice_cache_dir = tmp_path
+
+        mock_stt = AsyncMock()
+        mock_stt.transcribe.return_value = "今天天氣怎樣 用文字回我"
+        client.stt_client = mock_stt
+
+        mock_voice = AsyncMock()
+        client.voice_worker = mock_voice
+
+        async def fake_handler(text, chat_id, persona):
+            return "今天台北 25 度，晴天。"
+
+        client.set_message_handler(fake_handler)
+
+        update = self._make_update()
+        context = self._make_context()
+
+        await client._handle_voice_message(update, context)
+
+        # Should use text reply, NOT TTS
+        update.message.reply_text.assert_called()
+        call_text = update.message.reply_text.call_args[0][0]
+        assert "25 度" in call_text
+
+        # TTS should NOT be called
+        mock_voice.text_to_speech.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_force_text_reply_with_typing_keyword(self, tmp_path):
+        """'打字回' variant should also trigger text reply."""
+        client = self._make_client()
+        client._voice_cache_dir = tmp_path
+
+        mock_stt = AsyncMock()
+        mock_stt.transcribe.return_value = "你打字回我好了"
+        client.stt_client = mock_stt
+
+        mock_voice = AsyncMock()
+        client.voice_worker = mock_voice
+
+        async def fake_handler(text, chat_id, persona):
+            return "好的，Sir。"
+
+        client.set_message_handler(fake_handler)
+
+        update = self._make_update()
+        context = self._make_context()
+
+        await client._handle_voice_message(update, context)
+
+        update.message.reply_text.assert_called()
+        mock_voice.text_to_speech.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_normal_voice_still_uses_tts(self, tmp_path):
+        """Normal voice message without text keywords should still use TTS."""
+        client = self._make_client()
+        client._voice_cache_dir = tmp_path
+
+        mock_stt = AsyncMock()
+        mock_stt.transcribe.return_value = "今天天氣怎樣"
+        client.stt_client = mock_stt
+
+        reply_mp3 = tmp_path / "reply.mp3"
+        reply_mp3.write_bytes(b"\xff\xfb\x90\x00" * 50)
+
+        mock_voice = AsyncMock()
+        mock_voice.text_to_speech.return_value = str(reply_mp3)
+        client.voice_worker = mock_voice
+
+        async def fake_handler(text, chat_id, persona):
+            return "今天晴天。"
+
+        client.set_message_handler(fake_handler)
+
+        mock_bot = MagicMock()
+        mock_bot.send_voice = AsyncMock(return_value=MagicMock(message_id=100))
+        client._jarvis_bot = mock_bot
+
+        update = self._make_update()
+        context = self._make_context()
+
+        await client._handle_voice_message(update, context)
+
+        # Should use TTS voice
+        mock_voice.text_to_speech.assert_called_once()
+        mock_bot.send_voice.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reply_mode_text_from_ceo(self, tmp_path):
+        """CEO can return reply_mode='text' to force text reply."""
+        client = self._make_client()
+        client._voice_cache_dir = tmp_path
+
+        mock_stt = AsyncMock()
+        mock_stt.transcribe.return_value = "查資料"
+        client.stt_client = mock_stt
+
+        mock_voice = AsyncMock()
+        client.voice_worker = mock_voice
+
+        async def fake_handler(text, chat_id, persona):
+            return {"text": "查到了：xxx", "reply_mode": "text"}
+
+        client.set_message_handler(fake_handler)
+
+        update = self._make_update()
+        context = self._make_context()
+
+        await client._handle_voice_message(update, context)
+
+        update.message.reply_text.assert_called()
+        mock_voice.text_to_speech.assert_not_called()
+
+
+class TestWantsTextReply:
+    """Test the _wants_text_reply static method."""
+
+    def test_chinese_keywords(self):
+        from clients.telegram_client import TelegramClient
+        assert TelegramClient._wants_text_reply("用文字回我") is True
+        assert TelegramClient._wants_text_reply("你打字回我好了") is True
+        assert TelegramClient._wants_text_reply("不要語音") is True
+        assert TelegramClient._wants_text_reply("用打字的回覆") is True
+        assert TelegramClient._wants_text_reply("傳文字給我") is True
+
+    def test_normal_text(self):
+        from clients.telegram_client import TelegramClient
+        assert TelegramClient._wants_text_reply("今天天氣怎樣") is False
+        assert TelegramClient._wants_text_reply("幫我查高鐵") is False
+        assert TelegramClient._wants_text_reply("") is False
+
 
 class TestTelegramSendVoice:
     @pytest.mark.asyncio

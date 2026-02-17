@@ -259,7 +259,7 @@ class TelegramClient:
             ]
         ])
 
-        future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self._pending_confirms[callback_id] = future
 
         try:
@@ -321,6 +321,17 @@ class TelegramClient:
         if not self._allowed_user_ids:
             return True  # No whitelist configured → allow all
         return user_id in self._allowed_user_ids
+
+    _TEXT_REPLY_KEYWORDS = (
+        "用文字", "文字回", "打字回", "不要語音", "不要用語音",
+        "用打字", "text reply", "用 text", "傳文字", "回文字",
+    )
+
+    @staticmethod
+    def _wants_text_reply(transcribed: str) -> bool:
+        """Detect if user's voice message requests a text reply."""
+        lower = transcribed.lower()
+        return any(kw in lower for kw in TelegramClient._TEXT_REPLY_KEYWORDS)
 
     async def _simulate_typing(
         self, bot: Any, chat_id: int, text: str,
@@ -470,6 +481,9 @@ class TelegramClient:
 
         logger.info(f"[{persona}] STT result: {transcribed[:80]}")
 
+        # Detect if user requests text reply in their voice message
+        force_text = self._wants_text_reply(transcribed)
+
         # CEO Agent processes the transcribed text
         if not self._on_message:
             return
@@ -481,19 +495,27 @@ class TelegramClient:
             emotion = None
             phone = None
             booking_url = None
+            reply_mode = None
             if isinstance(reply, dict):
                 reply_text = reply.get("text", "")
                 emotion = reply.get("emotion")
                 phone = reply.get("phone")
                 booking_url = reply.get("booking_url")
+                reply_mode = reply.get("reply_mode")
             else:
                 reply_text = reply or ""
 
             if not reply_text:
                 return
 
-            # TTS: reply with voice if possible, fallback to text
-            if self._voice_worker:
+            # Determine reply mode: text or voice
+            use_text = force_text or reply_mode == "text"
+
+            if use_text or not self._voice_worker:
+                # Text reply (user requested or no TTS available)
+                await update.message.reply_text(reply_text)
+            else:
+                # TTS: reply with voice, fallback to text
                 try:
                     audio_path = await self._voice_worker.text_to_speech(
                         reply_text, persona=persona, emotion=emotion,
@@ -504,9 +526,6 @@ class TelegramClient:
                 except Exception as e:
                     logger.warning(f"TTS reply failed, falling back to text: {e}")
                     await update.message.reply_text(reply_text)
-            else:
-                # Fallback: send text if TTS unavailable or failed
-                await update.message.reply_text(reply_text)
 
             # K3: Send phone/booking_url as separate clickable messages
             if phone:

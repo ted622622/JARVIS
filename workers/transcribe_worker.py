@@ -188,6 +188,9 @@ class TranscribeWorker:
                     if pos > start:
                         end = pos + 1
                         break
+            # Safety: ensure forward progress
+            if end <= start:
+                end = start + CHUNK_SIZE
             chunks.append(text[start:end])
             start = end
         return chunks

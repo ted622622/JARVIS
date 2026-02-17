@@ -288,23 +288,24 @@ class SkillLearner:
         """Convert pattern to APScheduler cron kwargs."""
         cron: dict[str, Any] = {}
         freq = pattern.get("frequency", "irregular")
-        hours = pattern.get("peak_hours", [])
+        hours = [h for h in pattern.get("peak_hours", []) if 0 <= h <= 23]
 
-        if freq == "daily" and hours:
+        if not hours:
+            return cron
+
+        if freq == "daily":
             cron["hour"] = hours[0]
             cron["minute"] = 0
-        elif freq == "weekly" and hours:
-            weekdays = pattern.get("peak_weekdays", [])
+        elif freq == "weekly":
+            weekdays = [d for d in pattern.get("peak_weekdays", []) if 0 <= d <= 6]
             cron["hour"] = hours[0]
             cron["minute"] = 0
             if weekdays:
-                # APScheduler uses 'mon'-'sun' or 0-6
                 cron["day_of_week"] = ",".join(str(d) for d in weekdays)
         else:
             # Irregular — default to daily at detected peak hour
-            if hours:
-                cron["hour"] = hours[0]
-                cron["minute"] = 0
+            cron["hour"] = hours[0]
+            cron["minute"] = 0
 
         return cron
 
@@ -346,13 +347,16 @@ class SkillLearner:
             self._actions = []
 
     def _save_actions(self) -> None:
-        """Save action log to disk."""
+        """Save action log to disk (atomic write)."""
         self.LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.LOG_PATH.with_suffix(".tmp")
         try:
-            with open(self.LOG_PATH, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._actions, f, ensure_ascii=False, indent=2)
+            tmp.replace(self.LOG_PATH)
         except OSError as e:
             logger.debug(f"SkillLearner: save actions failed: {e}")
+            tmp.unlink(missing_ok=True)
 
     def _load_proposals(self) -> dict[str, str]:
         """Load proposal tracker from disk."""
@@ -365,10 +369,13 @@ class SkillLearner:
         return {}
 
     def _save_proposals(self, proposals: dict[str, str]) -> None:
-        """Save proposal tracker to disk."""
+        """Save proposal tracker to disk (atomic write)."""
         self.PROPOSALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.PROPOSALS_PATH.with_suffix(".tmp")
         try:
-            with open(self.PROPOSALS_PATH, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(proposals, f, ensure_ascii=False, indent=2)
+            tmp.replace(self.PROPOSALS_PATH)
         except OSError as e:
             logger.debug(f"SkillLearner: save proposals failed: {e}")
+            tmp.unlink(missing_ok=True)
