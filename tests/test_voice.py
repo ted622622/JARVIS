@@ -10,7 +10,8 @@ import pytest
 
 from clients.groq_stt_client import GroqSTTClient, GroqSTTError
 from workers.voice_worker import (
-    VoiceWorker, VoiceError, VoiceTextCleaner, VOICE_MAP, VOICE_RATE, VOICE_STYLE,
+    VoiceWorker, VoiceError, VoiceTextCleaner,
+    VOICE_MAP, VOICE_RATE, VOICE_STYLE, ZHIPU_VOICE_MAP,
 )
 
 
@@ -828,7 +829,7 @@ class TestZhipuTTS:
         body = call_kwargs[1]["json"]
         assert body["model"] == "glm-tts"
         assert body["input"] == "測試語音"
-        assert body["voice"] == "tongtong"
+        assert body["voice"] == "chuichui"  # JARVIS uses male voice
 
     @pytest.mark.asyncio
     async def test_zhipu_tts_no_key_skips(self, tmp_path):
@@ -953,8 +954,8 @@ class TestZhipuTTS:
         assert Path(path).exists()
 
     @pytest.mark.asyncio
-    async def test_zhipu_custom_voice(self, tmp_path):
-        """Custom zhipu_voice parameter is used in API call."""
+    async def test_zhipu_custom_voice_fallback(self, tmp_path):
+        """Custom zhipu_voice is used for unknown personas not in ZHIPU_VOICE_MAP."""
         worker = VoiceWorker(
             cache_dir=str(tmp_path),
             zhipu_key="test-key",
@@ -971,10 +972,41 @@ class TestZhipuTTS:
         mock_client.is_closed = False
         worker._http_client = mock_client
 
-        await worker._zhipu_tts("test", "jarvis", out_path)
+        await worker._zhipu_tts("test", "unknown_persona", out_path)
 
         body = mock_client.post.call_args[1]["json"]
         assert body["voice"] == "custom_voice"
+
+    @pytest.mark.asyncio
+    async def test_zhipu_per_persona_voice(self, tmp_path):
+        """JARVIS uses chuichui (male), Clawra uses tongtong (female)."""
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            zhipu_key="test-key",
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"\xff\xfb\x90\x00" * 100
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        mock_client.is_closed = False
+        worker._http_client = mock_client
+
+        # JARVIS → chuichui (male)
+        out_j = tmp_path / "j.mp3"
+        await worker._zhipu_tts("test", "jarvis", out_j)
+        body_j = mock_client.post.call_args[1]["json"]
+        assert body_j["voice"] == ZHIPU_VOICE_MAP["jarvis"]
+        assert body_j["voice"] == "chuichui"
+
+        # Clawra → tongtong (female)
+        out_c = tmp_path / "c.mp3"
+        await worker._zhipu_tts("test", "clawra", out_c)
+        body_c = mock_client.post.call_args[1]["json"]
+        assert body_c["voice"] == ZHIPU_VOICE_MAP["clawra"]
+        assert body_c["voice"] == "tongtong"
 
 
 class TestTTSFallbackChain:

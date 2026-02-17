@@ -31,6 +31,12 @@ VOICE_MAP: dict[str, str] = {
     "jarvis": "zh-TW-YunJheNeural",
 }
 
+# GLM-TTS voice per persona
+ZHIPU_VOICE_MAP: dict[str, str] = {
+    "clawra": "tongtong",    # 彤彤 — 女聲
+    "jarvis": "chuichui",    # 錘錘 — 男聲
+}
+
 VOICE_RATE: dict[str, str] = {
     "clawra": "+0%",
     "jarvis": "+5%",
@@ -123,10 +129,11 @@ class VoiceWorker:
             return False
 
         client = await self._get_http_client()
+        voice = ZHIPU_VOICE_MAP.get(persona, self.zhipu_voice)
         body: dict[str, Any] = {
             "model": "glm-tts",
             "input": text,
-            "voice": self.zhipu_voice,
+            "voice": voice,
             "response_format": "mp3",
         }
 
