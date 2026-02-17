@@ -149,7 +149,8 @@ FALLBACK_CHAINS: dict[str, list[str]] = {
     "code_task":      ["code", "knowledge"],
     "calendar":       ["gog", "knowledge"],    # H1 v2: gog CLI first
     "email":          ["gog", "knowledge"],    # H1 v2: gog CLI first
-    "booking":        ["browser", "knowledge"],
+    "booking":        ["browser", "assist"],   # H2: assist does 90% + options
+    "ticket":         ["browser", "assist"],   # H2: assist does 90% + options
     "general":        ["knowledge"],
 }
 
@@ -271,8 +272,10 @@ class ReactExecutor:
                         30.0,  # per-worker timeout cap
                     )
                     exec_kwargs = dict(kwargs)
-                    if worker_name == "knowledge" and attempts:
+                    if worker_name in ("knowledge", "assist") and attempts:
                         exec_kwargs["failed_attempts"] = attempts
+                    if worker_name == "assist":
+                        exec_kwargs["task_type"] = chain_name
 
                     result = await asyncio.wait_for(
                         worker.execute(task, **exec_kwargs),

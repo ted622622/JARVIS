@@ -246,6 +246,15 @@ async def main() -> None:
     else:
         logger.warning("    gog CLI: not available (Calendar/Gmail via gog disabled)")
 
+    # H2 v2: Assist Worker — 做到 90% 給選項
+    from workers.assist_worker import AssistWorker
+
+    workers["assist"] = AssistWorker(
+        model_router=router,
+        memory_search=memory_search,
+        gog_worker=gog_worker if gog_worker.is_available else None,
+    )
+
     ceo.workers = workers
     logger.info(f"  [8/12] Workers initialized ({len(workers)} workers)")
 

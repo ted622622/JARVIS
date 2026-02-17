@@ -1,5 +1,6 @@
 """Worker layer for J.A.R.V.I.S. — execution agents dispatched by CEO."""
 
+from .assist_worker import AssistWorker
 from .browser_worker import BrowserWorker
 from .code_worker import CodeWorker
 from .gog_worker import GogWorker
@@ -10,6 +11,7 @@ from .vision_worker import VisionWorker
 from .voice_worker import VoiceWorker
 
 __all__ = [
+    "AssistWorker",
     "BrowserWorker",
     "CodeWorker",
     "GogWorker",
