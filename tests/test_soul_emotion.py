@@ -166,7 +166,10 @@ class TestSelfieSkill:
         assert skill._fal_key == "test-key"
 
     @pytest.mark.asyncio
-    async def test_generate_without_any_key_fails(self):
+    async def test_generate_without_any_key_fails(self, monkeypatch):
+        monkeypatch.delenv("FAL_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_GENAI_API_KEY", raising=False)
         skill = SelfieSkill(fal_api_key="", google_api_key="")
         result = await skill.generate("test scene")
         assert not result.success
