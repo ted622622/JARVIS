@@ -331,6 +331,15 @@ async def main() -> None:
         longitude=float(os.environ.get("WEATHER_LONGITUDE", "121.4673")),
     )
 
+    # K1: ReminderManager
+    from core.reminder_manager import ReminderManager
+
+    reminder_mgr = ReminderManager(
+        path="./data/reminders.json",
+        scheduler=None,  # set after heartbeat.start()
+        telegram=telegram,
+    )
+
     heartbeat = Heartbeat(
         model_router=router,
         memos=memos,
@@ -340,9 +349,25 @@ async def main() -> None:
         weather_client=weather,
         pending_tasks=pending_mgr,
         react_executor=react_exec,
+        gog_worker=gog_worker if gog_worker.is_available else None,
+        reminder_manager=reminder_mgr,
     )
     heartbeat.start()
-    logger.info("  [9/12] Heartbeat Scheduler started")
+
+    # Wire scheduler into ReminderManager and load existing reminders
+    reminder_mgr._scheduler = heartbeat.scheduler
+    loaded_reminders = reminder_mgr.load_into_scheduler()
+    logger.info(f"  [9/12] Heartbeat Scheduler started ({loaded_reminders} reminders loaded)")
+
+    # K2: PostActionChain → CEO
+    from core.post_action_chain import PostActionChain
+
+    post_action = PostActionChain(
+        gog_worker=gog_worker if gog_worker.is_available else None,
+        reminder_manager=reminder_mgr,
+    )
+    ceo._post_action = post_action
+    logger.info("  [9b/12] PostActionChain initialized")
 
     # ── Step 10: Telegram polling ─────────────────────────────────
     async def on_telegram_message(user_text: str, chat_id: int, persona: str = "jarvis") -> dict | str:

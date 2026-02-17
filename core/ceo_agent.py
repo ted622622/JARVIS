@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -140,6 +141,7 @@ class CEOAgent:
         self.pending: Any = None  # H4: PendingTaskManager, set externally
         self._react: ReactExecutor | None = None
         self._fuse = FuseState()
+        self._post_action: Any = None  # K2: PostActionChain
         self._persona = "jarvis"
         self._session_id = "default"
         self._last_skill_failure: str | None = None
@@ -654,11 +656,37 @@ class CEOAgent:
                                 booking_details=booking_details,
                             )
                             if booking_result.get("status") == "booked":
+                                # K2: PostActionChain — calendar + reminders
+                                chain_note = ""
+                                if self._post_action and booking_details.get("date") and booking_details.get("time"):
+                                    try:
+                                        event_time = datetime.strptime(
+                                            f"{booking_details['date']} {booking_details['time']}",
+                                            "%Y-%m-%d %H:%M",
+                                        )
+                                        chain_result = await self._post_action.execute_chain(
+                                            "restaurant_booking",
+                                            event_time=event_time,
+                                            params={
+                                                "restaurant_name": result.get("name", restaurant),
+                                                "address": result.get("address", ""),
+                                            },
+                                        )
+                                        parts = []
+                                        if chain_result.get("calendar_added"):
+                                            parts.append("📅 已加入行事曆")
+                                        if chain_result.get("reminders_set", 0) > 0:
+                                            parts.append(f"⏰ 已設定 {chain_result['reminders_set']} 個提醒")
+                                        if parts:
+                                            chain_note = "\n" + " | ".join(parts)
+                                    except Exception as e:
+                                        logger.debug(f"PostActionChain failed: {e}")
                                 return {
                                     "text": (
                                         f"訂位完成！\n"
                                         f"店名: {result.get('name')}\n"
                                         f"{booking_result.get('result', '')}"
+                                        f"{chain_note}"
                                     ),
                                     "phone": result.get("phone"),
                                     "booking_url": None,

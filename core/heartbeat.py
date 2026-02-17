@@ -1,17 +1,19 @@
 """Heartbeat — proactive scheduling engine for J.A.R.V.I.S.
 
 Scheduled jobs:
-- hourly_patrol:  every 60 min — check calendar, emotions, decide if outreach needed
-- morning_brief:  daily 07:30 — weather + today's agenda summary
-- health_check:   every 6 hrs — SurvivalGate full diagnostics
-- backup:         daily 03:00 — encrypted MemOS + skills backup
-- night_owl:      cron check  — detect late-night activity, suggest rest
+- hourly_patrol:    every 60 min — check calendar, emotions, upcoming events alert
+- morning_brief:    daily 07:30 — weather + calendar (gog) + reminders + agenda
+- evening_summary:  daily 23:00 — today recap + tomorrow preview
+- health_check:     every 6 hrs — SurvivalGate full diagnostics
+- backup:           daily 03:00 — encrypted MemOS + skills backup
+- memory_cleanup:   daily 03:15 — purge old fired reminders
+- night_owl:        cron check  — detect late-night activity, suggest rest
 """
 
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -43,6 +45,8 @@ class Heartbeat:
         weather_client: Any = None,
         pending_tasks: Any = None,
         react_executor: Any = None,
+        gog_worker: Any = None,
+        reminder_manager: Any = None,
     ):
         self.router = model_router
         self.memos = memos
@@ -52,6 +56,8 @@ class Heartbeat:
         self.weather = weather_client
         self.pending = pending_tasks
         self.react = react_executor
+        self.gog = gog_worker
+        self.reminder = reminder_manager
 
         self.scheduler = AsyncIOScheduler()
         self._running = False
@@ -114,6 +120,28 @@ class Heartbeat:
             name="Night Owl Detection",
         )
 
+        # Evening summary (Patch K1)
+        evening_time = cfg.get("evening_summary_time", "23:00")
+        eh, em = map(int, evening_time.split(":"))
+        self.scheduler.add_job(
+            self.evening_summary,
+            "cron",
+            hour=eh,
+            minute=em,
+            id="evening_summary",
+            name="Evening Summary",
+        )
+
+        # Memory cleanup — after backup (Patch K1)
+        self.scheduler.add_job(
+            self.memory_cleanup,
+            "cron",
+            hour=bh,
+            minute=bm + 15 if bm + 15 < 60 else 0,
+            id="memory_cleanup",
+            name="Memory Cleanup",
+        )
+
         # Pending task retry (Patch H)
         if self.pending:
             self.scheduler.add_job(
@@ -173,10 +201,24 @@ class Heartbeat:
         active_tasks = await self.memos.working_memory.get("active_tasks", [])
         calendar_cache = await self.memos.working_memory.get("calendar_cache", [])
 
+        # K1: Check gog for upcoming events (30-min-ahead alert)
+        upcoming_events = self._get_upcoming_gog_events(60)
+        if upcoming_events:
+            calendar_cache = upcoming_events  # use real data if available
+            result["upcoming_events"] = len(upcoming_events)
+            # Send 30-min-ahead alerts for events starting in ≤30 min
+            soon_events = self._get_upcoming_gog_events(30)
+            if soon_events and self.telegram:
+                for ev in soon_events:
+                    summary = ev.get("summary", "行程")
+                    start = ev.get("start", {}).get("dateTime", "")
+                    await self.telegram.send(f"📅 30 分鐘後: {summary} ({start[-5:]})")
+                result["action"] = "sent_upcoming_alert"
+
         # Determine if we should reach out
         should_reach = self._should_reach_out(emotion, active_tasks, calendar_cache)
 
-        if should_reach:
+        if should_reach and result["action"] == "none":
             msg = await self._compose_caring_message(emotion, calendar_cache)
             if msg and self.telegram:
                 await self.telegram.send(msg)
@@ -192,25 +234,53 @@ class Heartbeat:
         return result
 
     async def morning_brief(self) -> str:
-        """Daily morning briefing: weather + agenda summary.
+        """Daily morning briefing: weather + calendar (gog) + reminders + agenda.
 
         Returns the formatted brief (for testing).
         """
         parts = ["☀️ *早安，Ted！*", ""]
 
-        # Weather (placeholder — will integrate real API later)
+        # Weather
         weather = await self._fetch_weather()
         parts.append(f"🌤 {weather}")
         parts.append("")
 
-        # Today's agenda from MemOS cache
-        agenda = await self._get_today_agenda()
-        if agenda:
-            parts.append("📋 *今日行程:*")
-            for i, event in enumerate(agenda, 1):
-                parts.append(f"  {i}. {event}")
+        # Today's calendar — prefer gog (real), fallback to MemOS cache
+        agenda = self._get_gog_today_events()
+        if agenda is not None:
+            if agenda:
+                parts.append("📋 *今日行程:*")
+                for i, ev in enumerate(agenda, 1):
+                    summary = ev.get("summary", "Unknown")
+                    start = ev.get("start", {}).get("dateTime", "")
+                    time_str = start[-5:] if start else ""
+                    parts.append(f"  {i}. {time_str} {summary}")
+            else:
+                parts.append("📋 今日沒有排定的行程")
         else:
-            parts.append("📋 今日沒有排定的行程")
+            # Fallback to MemOS cache
+            cache_agenda = await self._get_today_agenda()
+            if cache_agenda:
+                parts.append("📋 *今日行程:*")
+                for i, event in enumerate(cache_agenda, 1):
+                    parts.append(f"  {i}. {event}")
+            else:
+                parts.append("📋 今日沒有排定的行程（行事曆未連線）")
+
+        # Today's reminders
+        if self.reminder:
+            today_reminders = self.reminder.get_today()
+            if today_reminders:
+                parts.append("")
+                parts.append("⏰ *今日提醒:*")
+                for r in today_reminders:
+                    t = r["remind_at"][-5:]  # HH:MM
+                    parts.append(f"  - {t} {r['content']}")
+
+        # Trading day hint (weekday < 5)
+        if datetime.now().weekday() < 5:
+            parts.append("")
+            parts.append("📈 今天是交易日")
 
         # Token saving report
         if self.survival and self.survival.tracker:
@@ -370,6 +440,75 @@ class Heartbeat:
         logger.info(f"Pending task retry: {summary}")
         return summary
 
+    async def evening_summary(self) -> str:
+        """Nightly summary: today recap + tomorrow preview.
+
+        Returns the formatted summary (for testing).
+        """
+        parts = ["🌙 *晚安，Ted*", ""]
+
+        # Today's recap — markdown log line count
+        try:
+            from memory.markdown_memory import MarkdownMemory
+            md = MarkdownMemory("./memory")
+            today_log = md.read_daily()
+            if today_log:
+                line_count = len([l for l in today_log.strip().splitlines() if l.startswith("- ")])
+                parts.append(f"📝 今日記錄: {line_count} 條")
+            else:
+                parts.append("📝 今日沒有特別記錄")
+        except Exception:
+            parts.append("📝 今日記錄: (無法讀取)")
+
+        # Tomorrow's calendar via gog
+        tomorrow = datetime.now() + timedelta(days=1)
+        tomorrow_events = self._get_gog_events_for_date(tomorrow)
+        parts.append("")
+        if tomorrow_events is not None:
+            if tomorrow_events:
+                parts.append("📋 *明日行程:*")
+                for i, ev in enumerate(tomorrow_events, 1):
+                    summary = ev.get("summary", "Unknown")
+                    start = ev.get("start", {}).get("dateTime", "")
+                    time_str = start[-5:] if start else ""
+                    parts.append(f"  {i}. {time_str} {summary}")
+            else:
+                parts.append("📋 明日沒有排定的行程")
+        else:
+            parts.append("📋 明日行程: (行事曆未連線)")
+
+        # Tomorrow's reminders
+        if self.reminder:
+            tomorrow_reminders = self.reminder.get_for_date(tomorrow)
+            if tomorrow_reminders:
+                parts.append("")
+                parts.append("⏰ *明日提醒:*")
+                for r in tomorrow_reminders:
+                    t = r["remind_at"][-5:]
+                    parts.append(f"  - {t} {r['content']}")
+
+        parts.append("")
+        parts.append("好好休息，明天見 💤")
+
+        summary = "\n".join(parts)
+
+        if self.telegram:
+            await self.telegram.send(summary)
+
+        logger.info("Evening summary sent")
+        return summary
+
+    async def memory_cleanup(self) -> dict[str, int]:
+        """Clean up old fired reminders.
+
+        Returns cleanup result dict (for testing).
+        """
+        result = {"reminders_removed": 0}
+        if self.reminder:
+            result["reminders_removed"] = self.reminder.cleanup(days=7)
+        logger.info(f"Memory cleanup: {result}")
+        return result
+
     # ── Helpers ──────────────────────────────────────────────────
 
     def _should_reach_out(
@@ -444,3 +583,33 @@ class Heartbeat:
             if isinstance(e, dict) and e.get("date", "").startswith(today)
         ]
         return today_events
+
+    def _get_gog_today_events(self) -> list[dict] | None:
+        """Get today's events via gog CLI. Returns None if gog unavailable."""
+        if not self.gog or not self.gog.is_available:
+            return None
+        try:
+            return self.gog.get_today_events()
+        except Exception as e:
+            logger.warning(f"gog get_today_events failed: {e}")
+            return None
+
+    def _get_gog_events_for_date(self, date: datetime) -> list[dict] | None:
+        """Get events for a date via gog CLI. Returns None if gog unavailable."""
+        if not self.gog or not self.gog.is_available:
+            return None
+        try:
+            return self.gog.get_events_for_date(date)
+        except Exception as e:
+            logger.warning(f"gog get_events_for_date failed: {e}")
+            return None
+
+    def _get_upcoming_gog_events(self, minutes: int = 60) -> list[dict]:
+        """Get upcoming events via gog CLI. Returns empty list if unavailable."""
+        if not self.gog or not self.gog.is_available:
+            return []
+        try:
+            return self.gog.get_upcoming_events(minutes)
+        except Exception as e:
+            logger.warning(f"gog get_upcoming_events failed: {e}")
+            return []

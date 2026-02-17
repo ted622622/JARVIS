@@ -62,6 +62,7 @@ rate_limit:
 heartbeat:
   hourly_patrol_interval_minutes: 60
   morning_brief_time: "07:30"
+  evening_summary_time: "23:00"
   health_check_interval_hours: 6
   backup_time: "03:00"
 

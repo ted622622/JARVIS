@@ -189,7 +189,8 @@ class TestHeartbeat:
         hb.start()
         assert hb.is_running
         jobs = hb.get_jobs()
-        assert len(jobs) == 5  # patrol, brief, health, backup, night_owl
+        # patrol, brief, health, backup, night_owl, evening_summary, memory_cleanup
+        assert len(jobs) == 7
         hb.stop()
         assert not hb.is_running
 
@@ -203,6 +204,8 @@ class TestHeartbeat:
         assert "health_check" in job_ids
         assert "nightly_backup" in job_ids
         assert "night_owl" in job_ids
+        assert "evening_summary" in job_ids
+        assert "memory_cleanup" in job_ids
         hb.stop()
 
     @pytest.mark.asyncio
@@ -569,3 +572,241 @@ class TestPendingTaskRetry:
         job_ids = [j["id"] for j in hb.get_jobs()]
         assert "pending_tasks" not in job_ids
         hb.stop()
+
+
+# ── K1: Evening Summary Tests ──────────────────────────────────
+
+
+class TestEveningSummary:
+    @pytest.mark.asyncio
+    async def test_evening_summary_format(self, mock_telegram):
+        hb = Heartbeat(telegram=mock_telegram)
+        summary = await hb.evening_summary()
+        assert "晚安" in summary
+        assert "明日" in summary or "記錄" in summary
+        mock_telegram.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_evening_summary_without_telegram(self):
+        hb = Heartbeat()
+        summary = await hb.evening_summary()
+        assert "晚安" in summary
+
+    @pytest.mark.asyncio
+    async def test_evening_summary_with_gog_events(self, mock_telegram):
+        mock_gog = MagicMock()
+        mock_gog.is_available = True
+        mock_gog.get_events_for_date.return_value = [
+            {"summary": "Morning meeting", "start": {"dateTime": "2026-02-17T09:00:00"}},
+        ]
+        hb = Heartbeat(telegram=mock_telegram, gog_worker=mock_gog)
+        summary = await hb.evening_summary()
+        assert "Morning meeting" in summary
+
+    @pytest.mark.asyncio
+    async def test_evening_summary_no_gog(self, mock_telegram):
+        hb = Heartbeat(telegram=mock_telegram)
+        summary = await hb.evening_summary()
+        assert "行事曆未連線" in summary
+
+    @pytest.mark.asyncio
+    async def test_evening_summary_with_reminders(self, mock_telegram, tmp_path):
+        from datetime import datetime, timedelta
+        from core.reminder_manager import ReminderManager
+        rm = ReminderManager(path=str(tmp_path / "rem.json"))
+        tomorrow = datetime.now() + timedelta(days=1)
+        tomorrow = tomorrow.replace(hour=10, minute=0, second=0, microsecond=0)
+        await rm.add("Review PR", tomorrow)
+        hb = Heartbeat(telegram=mock_telegram, reminder_manager=rm)
+        summary = await hb.evening_summary()
+        assert "Review PR" in summary
+
+    @pytest.mark.asyncio
+    async def test_evening_summary_config_time(self):
+        hb = Heartbeat(config={"heartbeat": {"evening_summary_time": "22:00"}})
+        hb.start()
+        job_ids = [j["id"] for j in hb.get_jobs()]
+        assert "evening_summary" in job_ids
+        hb.stop()
+
+
+# ── K1: Enhanced Morning Brief Tests ───────────────────────────
+
+
+class TestMorningBriefGog:
+    @pytest.mark.asyncio
+    async def test_brief_with_gog_events(self, memos, mock_telegram):
+        mock_gog = MagicMock()
+        mock_gog.is_available = True
+        mock_gog.get_today_events.return_value = [
+            {"summary": "Standup", "start": {"dateTime": "2026-02-16T09:00:00"}},
+            {"summary": "Code review", "start": {"dateTime": "2026-02-16T14:00:00"}},
+        ]
+        hb = Heartbeat(memos=memos, telegram=mock_telegram, gog_worker=mock_gog)
+        brief = await hb.morning_brief()
+        assert "Standup" in brief
+        assert "Code review" in brief
+
+    @pytest.mark.asyncio
+    async def test_brief_gog_unavailable_falls_back(self, memos, mock_telegram):
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        await memos.working_memory.set("calendar_cache", [
+            {"date": f"{today}T09:00", "summary": "Cache event"},
+        ], agent_id="test")
+
+        hb = Heartbeat(memos=memos, telegram=mock_telegram)
+        brief = await hb.morning_brief()
+        assert "Cache event" in brief
+
+    @pytest.mark.asyncio
+    async def test_brief_no_gog_no_cache(self, memos, mock_telegram):
+        hb = Heartbeat(memos=memos, telegram=mock_telegram)
+        brief = await hb.morning_brief()
+        assert "行事曆未連線" in brief
+
+    @pytest.mark.asyncio
+    async def test_brief_includes_reminders(self, memos, mock_telegram, tmp_path):
+        from datetime import datetime, timedelta
+        from core.reminder_manager import ReminderManager
+        rm = ReminderManager(path=str(tmp_path / "rem.json"))
+        today_10 = datetime.now().replace(hour=22, minute=0, second=0, microsecond=0)
+        if today_10 < datetime.now():
+            today_10 += timedelta(days=1)
+        await rm.add("Check stocks", today_10)
+        hb = Heartbeat(memos=memos, telegram=mock_telegram, reminder_manager=rm)
+        brief = await hb.morning_brief()
+        # Only passes if reminder is for today
+        if today_10.date() == datetime.now().date():
+            assert "Check stocks" in brief
+
+    @pytest.mark.asyncio
+    async def test_brief_trading_day(self, memos, mock_telegram):
+        from datetime import datetime
+        hb = Heartbeat(memos=memos, telegram=mock_telegram)
+        brief = await hb.morning_brief()
+        if datetime.now().weekday() < 5:
+            assert "交易日" in brief
+
+
+# ── K1: Enhanced Patrol Tests ──────────────────────────────────
+
+
+class TestPatrolUpcoming:
+    @pytest.mark.asyncio
+    async def test_patrol_with_upcoming_events(self, memos, mock_router, mock_telegram):
+        mock_gog = MagicMock()
+        mock_gog.is_available = True
+        mock_gog.get_upcoming_events.return_value = [
+            {"summary": "Meeting", "start": {"dateTime": "2026-02-16T10:30:00"}},
+        ]
+        await memos.working_memory.set("user_emotion", "normal", agent_id="test")
+
+        hb = Heartbeat(
+            model_router=mock_router,
+            memos=memos,
+            telegram=mock_telegram,
+            gog_worker=mock_gog,
+        )
+        result = await hb.hourly_patrol()
+        assert result.get("upcoming_events", 0) >= 1
+
+    @pytest.mark.asyncio
+    async def test_patrol_no_gog(self, memos, mock_router, mock_telegram):
+        await memos.working_memory.set("user_emotion", "normal", agent_id="test")
+        hb = Heartbeat(model_router=mock_router, memos=memos, telegram=mock_telegram)
+        result = await hb.hourly_patrol()
+        assert result.get("upcoming_events", 0) == 0
+
+
+# ── K1: Memory Cleanup Tests ──────────────────────────────────
+
+
+class TestMemoryCleanup:
+    @pytest.mark.asyncio
+    async def test_cleanup_with_reminder(self, tmp_path):
+        from datetime import datetime, timedelta
+        from core.reminder_manager import ReminderManager
+        rm = ReminderManager(path=str(tmp_path / "rem.json"))
+        old = datetime.now() - timedelta(days=10)
+        rm._reminders.append({
+            "id": "rem_old",
+            "content": "old",
+            "remind_at": old.isoformat(),
+            "source": "user",
+            "fired": True,
+        })
+        rm._save()
+        hb = Heartbeat(reminder_manager=rm)
+        result = await hb.memory_cleanup()
+        assert result["reminders_removed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_cleanup_without_reminder(self):
+        hb = Heartbeat()
+        result = await hb.memory_cleanup()
+        assert result["reminders_removed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_memory_cleanup_job_exists(self):
+        hb = Heartbeat()
+        hb.start()
+        job_ids = [j["id"] for j in hb.get_jobs()]
+        assert "memory_cleanup" in job_ids
+        hb.stop()
+
+
+# ── K1: Gog Helper Tests ──────────────────────────────────────
+
+
+class TestGogHelpers:
+    def test_get_gog_today_events_no_gog(self):
+        hb = Heartbeat()
+        assert hb._get_gog_today_events() is None
+
+    def test_get_gog_today_events_unavailable(self):
+        mock_gog = MagicMock()
+        mock_gog.is_available = False
+        hb = Heartbeat(gog_worker=mock_gog)
+        assert hb._get_gog_today_events() is None
+
+    def test_get_gog_today_events_success(self):
+        mock_gog = MagicMock()
+        mock_gog.is_available = True
+        mock_gog.get_today_events.return_value = [{"summary": "Test"}]
+        hb = Heartbeat(gog_worker=mock_gog)
+        result = hb._get_gog_today_events()
+        assert len(result) == 1
+
+    def test_get_gog_today_events_exception(self):
+        mock_gog = MagicMock()
+        mock_gog.is_available = True
+        mock_gog.get_today_events.side_effect = RuntimeError("fail")
+        hb = Heartbeat(gog_worker=mock_gog)
+        assert hb._get_gog_today_events() is None
+
+    def test_get_upcoming_gog_events_no_gog(self):
+        hb = Heartbeat()
+        assert hb._get_upcoming_gog_events(60) == []
+
+    def test_get_upcoming_gog_events_success(self):
+        mock_gog = MagicMock()
+        mock_gog.is_available = True
+        mock_gog.get_upcoming_events.return_value = [{"summary": "Soon"}]
+        hb = Heartbeat(gog_worker=mock_gog)
+        result = hb._get_upcoming_gog_events(60)
+        assert len(result) == 1
+
+    def test_get_gog_events_for_date_no_gog(self):
+        from datetime import datetime
+        hb = Heartbeat()
+        assert hb._get_gog_events_for_date(datetime.now()) is None
+
+    def test_get_gog_events_for_date_success(self):
+        from datetime import datetime
+        mock_gog = MagicMock()
+        mock_gog.is_available = True
+        mock_gog.get_events_for_date.return_value = [{"summary": "Event"}]
+        hb = Heartbeat(gog_worker=mock_gog)
+        result = hb._get_gog_events_for_date(datetime.now())
+        assert len(result) == 1
