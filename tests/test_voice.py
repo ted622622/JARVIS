@@ -1230,39 +1230,59 @@ class TestVoiceTextCleaner:
 
 
 class TestTrimLeadingTone:
-    """GLM-TTS embeds a ~120ms tone at start — _trim_leading_tone removes it."""
+    """GLM-TTS embeds tone bursts before speech — _trim_leading_tone removes them."""
 
-    def _make_wav(self, framerate: int = 24000, n_frames: int = 12000,
-                  sampwidth: int = 2, n_channels: int = 1) -> bytes:
-        """Create a valid WAV with sequential frame values."""
-        import struct
+    @staticmethod
+    def _make_wav(segments: list[tuple[int, int]],
+                  framerate: int = 24000) -> bytes:
+        """Create WAV with specified segments.
+
+        segments: list of (amplitude, duration_ms) pairs.
+        Example: [(1794, 120), (0, 170), (1794, 120), (0, 50)]
+        = tone 120ms, silence 170ms, tone 120ms, silence 50ms
+        """
+        import struct as st
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
-            w.setnchannels(n_channels)
-            w.setsampwidth(sampwidth)
+            w.setnchannels(1)
+            w.setsampwidth(2)
             w.setframerate(framerate)
-            # Write frames: 0,1,2,... so we can verify which were kept
-            data = b"".join(struct.pack("<h", i % 32000) for i in range(n_frames))
-            w.writeframes(data)
+            for amp, dur_ms in segments:
+                n = int(framerate * dur_ms / 1000)
+                data = st.pack(f"<{n}h", *([amp] * n))
+                w.writeframes(data)
         return buf.getvalue()
 
-    def test_trims_150ms(self, tmp_path):
-        raw = self._make_wav(framerate=24000, n_frames=12000)  # 500ms total
-        trimmed = VoiceWorker._trim_leading_tone(raw, trim_ms=150)
+    def test_trims_single_tone(self):
+        # tone 120ms → silence → speech
+        raw = self._make_wav([(1794, 120), (0, 50), (100, 500)])
+        trimmed = VoiceWorker._trim_leading_tone(raw)
         assert trimmed != raw
+        with wave.open(io.BytesIO(trimmed), "rb") as w:
+            # Should have removed 120ms tone + 20ms margin = 140ms
+            # Remaining: ~530ms of the original 670ms
+            assert w.getnframes() < 24000 * 670 / 1000
 
-        # Verify shorter by ~150ms worth of frames
-        with wave.open(io.BytesIO(raw), "rb") as src:
-            orig_frames = src.getnframes()
-        with wave.open(io.BytesIO(trimmed), "rb") as dst:
-            new_frames = dst.getnframes()
-        expected_skip = int(24000 * 150 / 1000)  # 3600
-        assert new_frames == orig_frames - expected_skip
+    def test_trims_double_tone(self):
+        # Matches real GLM-TTS: tone → silence → tone → silence → speech
+        raw = self._make_wav([
+            (1794, 120),  # first tone
+            (0, 170),     # gap
+            (1794, 120),  # second tone
+            (0, 50),      # gap before speech
+            (100, 2000),  # actual speech
+        ])
+        trimmed = VoiceWorker._trim_leading_tone(raw)
+        with wave.open(io.BytesIO(trimmed), "rb") as w:
+            trimmed_dur = w.getnframes() / w.getframerate() * 1000
+        # Both tones removed: ~410ms of preamble gone, ~2050ms remains
+        assert trimmed_dur < 2100
+        assert trimmed_dur > 1900
 
-    def test_no_trim_if_audio_shorter_than_window(self, tmp_path):
-        # 100ms audio, 150ms trim window → should return original
-        raw = self._make_wav(framerate=24000, n_frames=2400)  # 100ms
-        trimmed = VoiceWorker._trim_leading_tone(raw, trim_ms=150)
+    def test_no_trim_if_no_tone(self):
+        # Normal audio — no tone detected, should return original
+        raw = self._make_wav([(100, 3000)])
+        trimmed = VoiceWorker._trim_leading_tone(raw)
         assert trimmed == raw
 
     def test_returns_raw_on_invalid_input(self):
@@ -1271,9 +1291,8 @@ class TestTrimLeadingTone:
         assert result == bad
 
     def test_valid_wav_output(self):
-        raw = self._make_wav()
+        raw = self._make_wav([(1794, 120), (0, 50), (100, 2000)])
         trimmed = VoiceWorker._trim_leading_tone(raw)
-        # Should be parseable as WAV
         with wave.open(io.BytesIO(trimmed), "rb") as w:
             assert w.getnchannels() == 1
             assert w.getsampwidth() == 2

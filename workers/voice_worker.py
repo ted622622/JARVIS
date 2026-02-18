@@ -13,6 +13,7 @@ import hashlib
 import html
 import io
 import re
+import struct
 import subprocess
 import wave
 from pathlib import Path
@@ -135,13 +136,21 @@ class VoiceWorker:
         )
 
     @staticmethod
-    def _trim_leading_tone(raw_wav: bytes, trim_ms: int = 150) -> bytes:
-        """Trim the first *trim_ms* milliseconds from GLM-TTS WAV output.
+    def _trim_leading_tone(
+        raw_wav: bytes,
+        tone_threshold: int = 500,
+        scan_limit_ms: int = 800,
+    ) -> bytes:
+        """Remove GLM-TTS leading tones from WAV audio.
 
-        GLM-TTS embeds a ~120 ms constant-amplitude tone at the start of
-        every audio file.  Trimming the first 150 ms removes it cleanly
-        without cutting into the actual speech (there's a silence gap
-        between the tone and the first spoken word).
+        GLM-TTS embeds multiple ~120 ms constant-amplitude tone bursts
+        (max ~1794, avg ~1137) before the actual speech begins.  Pattern:
+        tone → silence → tone → silence → speech.
+
+        Strategy: scan the first *scan_limit_ms* in 10 ms windows.
+        Find the last window whose average absolute amplitude exceeds
+        *tone_threshold*, then trim everything up to and including that
+        window (plus a small 20 ms margin).
 
         Returns cleaned WAV bytes.  On any error, returns the original.
         """
@@ -152,14 +161,39 @@ class VoiceWorker:
             sampwidth = src.getsampwidth()
             n_frames = src.getnframes()
 
-            skip_frames = int(framerate * trim_ms / 1000)
-            if skip_frames >= n_frames:
+            if sampwidth != 2:
                 src.close()
-                return raw_wav  # audio shorter than trim window — keep as-is
+                return raw_wav  # only handle 16-bit PCM
 
-            src.readframes(skip_frames)  # advance past the tone
+            window_frames = int(framerate * 0.01)  # 10 ms
+            max_windows = int(scan_limit_ms / 10)
+            scan_windows = min(max_windows, n_frames // window_frames)
+
+            last_tone_end = 0  # frame index past the last tone window
+            for i in range(scan_windows):
+                chunk = src.readframes(window_frames)
+                samples = struct.unpack(f"<{len(chunk) // 2}h", chunk)
+                avg_abs = sum(abs(s) for s in samples) // len(samples)
+                if avg_abs > tone_threshold:
+                    last_tone_end = (i + 1) * window_frames
+
+            if last_tone_end == 0:
+                src.close()
+                return raw_wav  # no tone detected — keep as-is
+
+            # Add 20 ms margin after last tone
+            margin_frames = int(framerate * 0.02)
+            skip_frames = min(last_tone_end + margin_frames, n_frames)
+
+            # Re-open and skip to the cut point
+            src.close()
+            src = wave.open(io.BytesIO(raw_wav), "rb")
+            src.readframes(skip_frames)
             remaining = src.readframes(n_frames - skip_frames)
             src.close()
+
+            if not remaining:
+                return raw_wav  # nothing left after trim
 
             buf = io.BytesIO()
             with wave.open(buf, "wb") as dst:
@@ -167,6 +201,11 @@ class VoiceWorker:
                 dst.setsampwidth(sampwidth)
                 dst.setframerate(framerate)
                 dst.writeframes(remaining)
+
+            logger.debug(
+                f"WAV tone trim: removed first {skip_frames/framerate*1000:.0f}ms "
+                f"({skip_frames} frames)"
+            )
             return buf.getvalue()
         except Exception as e:
             logger.debug(f"WAV trim skipped ({e}), using raw")
