@@ -966,6 +966,8 @@ class TestZhipuTTS:
         assert body["model"] == "glm-tts"
         assert body["input"] == "測試語音"
         assert body["voice"] == "chuichui"  # JARVIS uses male voice
+        assert body["response_format"] == "wav"
+        assert body["speed"] == 1.0
 
     @pytest.mark.asyncio
     async def test_zhipu_tts_no_key_skips(self, tmp_path):
@@ -984,6 +986,7 @@ class TestZhipuTTS:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 401
+        mock_resp.text = "Unauthorized"
 
         mock_client = AsyncMock()
         mock_client.post.return_value = mock_resp
@@ -1115,7 +1118,7 @@ class TestZhipuTTS:
 
     @pytest.mark.asyncio
     async def test_zhipu_per_persona_voice(self, tmp_path):
-        """JARVIS uses chuichui (male), Clawra uses douji (female, Patch T+)."""
+        """JARVIS uses chuichui (male), Clawra uses tongtong (female)."""
         worker = VoiceWorker(
             cache_dir=str(tmp_path),
             zhipu_key="test-key",

@@ -493,7 +493,7 @@ class Heartbeat:
                 if status == "COMPLETED":
                     result = await self.fal_client.fetch_queue_result(entry["response_url"])
                     persona = entry.get("persona", "clawra")
-                    caption = "欸嘿～剛剛的照片好了！" if persona == "clawra" else "Sir, 照片已備妥。"
+                    caption = "欸嘿 剛剛的照片好了！" if persona == "clawra" else "Sir, 照片已備妥。"
                     if self.telegram:
                         await self.telegram.send_photo(result.url, caption=caption, persona=persona)
                     entry["status"] = "delivered"

@@ -453,7 +453,7 @@ class TelegramClient:
                 if complexity["is_long"]:
                     est = complexity["estimate_seconds"]
                     if persona == "clawra":
-                        ack = f"欸收到！讓我看看...大概要等個 {est} 秒左右喔～"
+                        ack = f"欸收到！讓我看看...大概要等個 {est} 秒左右喔"
                     else:
                         ack = f"收到，正在處理中。預計需要 {est} 秒。"
                     await bot.send_message(chat_id=chat_id, text=ack)
@@ -472,7 +472,7 @@ class TelegramClient:
         except Exception as e:
             logger.error(f"[{persona}] Batch handler error: {e}")
             fallback = (
-                "欸...我這邊好像出了點小狀況 >< 等我一下喔～"
+                "欸...我這邊好像出了點小狀況，等我一下喔"
                 if persona == "clawra"
                 else "Sir, 系統暫時出了點問題，我正在處理中。"
             )
@@ -486,7 +486,7 @@ class TelegramClient:
     ) -> None:
         """Send CEO reply. Clawra splits long text into multiple messages."""
         _empty_fallback = (
-            "嗯...我想了一下但不太確定怎麼回，你可以換個方式問問看嗎～"
+            "嗯...我想了一下但不太確定怎麼回，你可以換個方式問問看嗎"
             if persona == "clawra"
             else "Sir, 我已處理完成，但未能產生有效回覆。請換個方式描述您的需求。"
         )
@@ -579,7 +579,7 @@ class TelegramClient:
         # Check STT client availability
         if not self._stt_client:
             if persona == "clawra":
-                await update.message.reply_text("欸～我現在還聽不懂語音啦 >< 先打字給我好不好～")
+                await update.message.reply_text("欸我現在還聽不懂語音啦，先打字給我好不好")
             else:
                 await update.message.reply_text("Sir, 語音辨識模組尚未啟用，請先設定 GROQ_API_KEY。")
             return
@@ -593,7 +593,7 @@ class TelegramClient:
         except Exception as e:
             logger.error(f"Failed to download voice: {e}")
             if persona == "clawra":
-                await update.message.reply_text("啊...語音好像沒收到耶，再傳一次給我好嗎～")
+                await update.message.reply_text("啊...語音好像沒收到耶，再傳一次給我好嗎")
             else:
                 await update.message.reply_text("Sir, 語音下載失敗，請再試一次。")
             return
@@ -604,7 +604,7 @@ class TelegramClient:
         except Exception as e:
             logger.error(f"STT failed: {e}")
             if persona == "clawra":
-                await update.message.reply_text("嗚嗚我沒聽清楚啦～再說一次好不好？")
+                await update.message.reply_text("嗚嗚我沒聽清楚啦，再說一次好不好")
             else:
                 await update.message.reply_text("Sir, 語音辨識失敗，請再試一次。")
             return
@@ -614,7 +614,7 @@ class TelegramClient:
 
         if not transcribed.strip():
             if persona == "clawra":
-                await update.message.reply_text("欸？好像什麼都沒聽到耶～你有在說話嗎？")
+                await update.message.reply_text("欸？好像什麼都沒聽到耶，你有在說話嗎")
             else:
                 await update.message.reply_text("Sir, 未偵測到語音內容。")
             return
@@ -676,7 +676,7 @@ class TelegramClient:
         except Exception as e:
             logger.error(f"[{persona}] Voice message handler error: {e}")
             if persona == "clawra":
-                await update.message.reply_text("欸...語音處理好像出了點小問題 >< 等我一下喔～")
+                await update.message.reply_text("欸...語音處理好像出了點小問題，等我一下喔")
             else:
                 await update.message.reply_text("Sir, 語音處理暫時出了點問題，我正在處理中。")
 
@@ -702,7 +702,7 @@ class TelegramClient:
         if not self._transcribe_worker:
             await update.message.reply_text(
                 "Sir，長音檔轉錄模組尚未啟用。" if persona == "jarvis"
-                else "欸～我現在還沒辦法處理長音檔耶 ><"
+                else "欸我現在還沒辦法處理長音檔耶"
             )
             return
 
@@ -717,7 +717,7 @@ class TelegramClient:
 
         await update.message.reply_text(
             "收到音檔，正在轉錄中，請稍候 ..." if persona == "jarvis"
-            else "收到～讓我聽聽看，等我一下喔～"
+            else "收到！讓我聽聽看，等我一下喔"
         )
 
         # Download audio file

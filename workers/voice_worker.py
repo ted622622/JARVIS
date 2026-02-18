@@ -86,11 +86,11 @@ class VoiceWorker:
             self._http_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
         return self._http_client
 
-    def _cache_path(self, text: str, persona: str) -> Path:
+    def _cache_path(self, text: str, persona: str, ext: str = ".mp3") -> Path:
         """Generate a deterministic cache path for a text+persona combo."""
         key = f"{persona}:{text}"
         h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-        return self.cache_dir / f"{h}.mp3"
+        return self.cache_dir / f"{h}{ext}"
 
     @staticmethod
     def _insert_breaks(escaped_text: str) -> str:
@@ -134,7 +134,8 @@ class VoiceWorker:
             "model": "glm-tts",
             "input": text,
             "voice": voice,
-            "response_format": "mp3",
+            "response_format": "wav",
+            "speed": 1.0,
         }
 
         try:
@@ -144,7 +145,10 @@ class VoiceWorker:
                 headers={"Authorization": f"Bearer {self.zhipu_key}"},
             )
             if resp.status_code != 200:
-                logger.warning(f"GLM-TTS failed ({resp.status_code})")
+                logger.warning(
+                    f"GLM-TTS failed ({resp.status_code}): "
+                    f"{resp.text[:200] if resp.text else 'no body'}"
+                )
                 return False
 
             out_path.write_bytes(resp.content)
@@ -252,7 +256,7 @@ class VoiceWorker:
             emotion: CEO emotion label (reserved for future use)
 
         Returns:
-            Path to the generated MP3 file
+            Path to the generated audio file (WAV or MP3)
 
         Raises:
             VoiceError: If all TTS engines fail
@@ -263,22 +267,26 @@ class VoiceWorker:
         if not text.strip():
             raise VoiceError("Empty text provided for TTS")
 
-        out_path = self._cache_path(text, persona)
+        wav_path = self._cache_path(text, persona, ".wav")
+        mp3_path = self._cache_path(text, persona, ".mp3")
 
-        # Return cached version if exists and non-empty
-        if out_path.exists() and out_path.stat().st_size > 0:
-            logger.debug(f"TTS cache hit: {out_path.name}")
-            return str(out_path)
+        # Return cached version if exists and non-empty (check both formats)
+        if wav_path.exists() and wav_path.stat().st_size > 0:
+            logger.debug(f"TTS cache hit: {wav_path.name}")
+            return str(wav_path)
+        if mp3_path.exists() and mp3_path.stat().st_size > 0:
+            logger.debug(f"TTS cache hit: {mp3_path.name}")
+            return str(mp3_path)
 
-        # Three-tier fallback: GLM-TTS → Azure → edge-tts
-        if await self._zhipu_tts(text, persona, out_path):
-            return str(out_path)
+        # Three-tier fallback: GLM-TTS (wav) → Azure (mp3) → edge-tts (mp3)
+        if await self._zhipu_tts(text, persona, wav_path):
+            return str(wav_path)
 
-        if await self._azure_tts(text, persona, out_path):
-            return str(out_path)
+        if await self._azure_tts(text, persona, mp3_path):
+            return str(mp3_path)
 
-        if await self._edge_tts(text, persona, out_path):
-            return str(out_path)
+        if await self._edge_tts(text, persona, mp3_path):
+            return str(mp3_path)
 
         raise VoiceError("All TTS engines failed")
 

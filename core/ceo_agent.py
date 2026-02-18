@@ -241,7 +241,7 @@ class CEOAgent:
         if now < self._silent_until:
             await self._store_conversation(user_message, "[靜默中，稍後回覆]", session_id)
             if active_persona == "clawra":
-                return "嗯...我現在有點累，等我一下下喔～💤"
+                return "嗯...我現在有點累，等我一下下喔"
             return "Sir, 系統正在短暫休息中，稍後恢復服務。"
 
         # Was silent but now recovered — send welcome back
@@ -425,7 +425,7 @@ class CEOAgent:
             if _booking_phone:
                 parts.append(f"電話: {_booking_phone}")
             if active_persona == "clawra":
-                parts = [f"欸找到了！{restaurant_name}的訂位連結在這～"]
+                parts = [f"欸找到了！{restaurant_name}的訂位連結在這"]
                 if _booking_phone:
                     parts.append(f"電話是 {_booking_phone}")
             logger.info(f"Booking short-circuit: {restaurant_name}, url={_booking_url[:60]}")
@@ -549,7 +549,7 @@ class CEOAgent:
         if not reply or not reply.strip():
             logger.warning("CEO reply is empty after processing, applying fallback")
             if active_persona == "clawra":
-                reply = "嗯...我查到了一些東西但整理時出了問題，你可以再問一次嗎～"
+                reply = "嗯...我查到了一些東西但整理時出了問題，你可以再問一次嗎"
             else:
                 reply = "Sir, 我已取得相關資料，但整理回覆時遇到問題。請再試一次。"
 
@@ -941,7 +941,7 @@ class CEOAgent:
             )
             caption = resp.content.strip()
         except Exception:
-            caption = "剛拍的～" if persona == "clawra" else "如您所求，Sir。"
+            caption = "剛拍的" if persona == "clawra" else "如您所求，Sir。"
 
         # Store to MemOS
         await self._store_conversation(user_message, f"[自拍] {caption}", session_id)
