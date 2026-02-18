@@ -1137,12 +1137,12 @@ class TestZhipuTTS:
         assert body_j["voice"] == ZHIPU_VOICE_MAP["jarvis"]
         assert body_j["voice"] == "chuichui"
 
-        # Clawra → douji (female, Patch T+)
+        # Clawra → tongtong (female)
         out_c = tmp_path / "c.mp3"
         await worker._zhipu_tts("test", "clawra", out_c)
         body_c = mock_client.post.call_args[1]["json"]
         assert body_c["voice"] == ZHIPU_VOICE_MAP["clawra"]
-        assert body_c["voice"] == "douji"
+        assert body_c["voice"] == "tongtong"
 
 
 class TestTTSFallbackChain:
@@ -1224,11 +1224,11 @@ class TestVoiceTextCleaner:
 # ── Selfie Worker Dual Mode ──────────────────────────────────
 
 
-class TestClawraVoiceIsDoji:
-    """Patch T+: Clawra voice should be douji."""
+class TestClawraVoice:
+    """Clawra voice should be tongtong (female)."""
 
-    def test_clawra_voice_is_douji(self):
-        assert ZHIPU_VOICE_MAP["clawra"] == "douji"
+    def test_clawra_voice_is_tongtong(self):
+        assert ZHIPU_VOICE_MAP["clawra"] == "tongtong"
 
     def test_jarvis_voice_unchanged(self):
         assert ZHIPU_VOICE_MAP["jarvis"] == "chuichui"
