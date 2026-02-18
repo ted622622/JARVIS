@@ -217,7 +217,7 @@ class SelfieSkill:
             raise ValueError("No image in Gemini response")
 
         os.makedirs("./data/selfies", exist_ok=True)
-        return await asyncio.get_event_loop().run_in_executor(None, _call)
+        return await asyncio.to_thread(_call)
 
     async def _check_consistency(self, image_url: str) -> float:
         """Compare generated image against anchor using vision model."""

@@ -63,7 +63,7 @@ class ZhipuClient(BaseClient):
                 **kwargs,
             )
 
-        resp = await asyncio.get_event_loop().run_in_executor(None, _call)
+        resp = await asyncio.to_thread(_call)
 
         return ChatResponse(
             content=resp.choices[0].message.content,
@@ -97,7 +97,7 @@ class ZhipuClient(BaseClient):
                 **kwargs,
             )
 
-        resp = await asyncio.get_event_loop().run_in_executor(None, _call)
+        resp = await asyncio.to_thread(_call)
 
         return ImageResponse(
             url=resp.data[0].url,

@@ -23,6 +23,13 @@ from urllib.parse import quote_plus
 
 from loguru import logger
 
+try:
+    from opencc import OpenCC
+    _s2t = OpenCC("s2t")
+except ImportError:
+    _s2t = None
+    logger.warning("OpenCC not installed — Clawra s2t filter disabled")
+
 from clients.base_client import ChatMessage, ChatResponse
 from core.model_router import ModelRole, ModelRouter, RouterError
 from core.conversation_compressor import ConversationCompressor
@@ -101,6 +108,13 @@ def _clean_llm_reply(text: str) -> str:
     if m:
         text = m.group(1).strip()
     return text.strip()
+
+
+def _force_traditional_chinese(text: str) -> str:
+    """Convert any leaked simplified Chinese to traditional Chinese."""
+    if not text or _s2t is None:
+        return text
+    return _s2t.convert(text)
 
 
 # ── H1 v2: Task Resolution Chains ────────────────────────────────
@@ -232,6 +246,8 @@ class CEOAgent:
         self._shared_memory: SharedMemory | None = None
         # Phase 2: Agent SDK executor (lazy-init)
         self._agent_executor: Any = None
+        # Emotion passthrough for voice TTS
+        self._last_emotion: str = "normal"
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -273,7 +289,7 @@ class CEOAgent:
             logger.info("Silent mode ended, resuming normal operation")
 
         try:
-            return await self._process_message(
+            result = await self._process_message(
                 user_message, active_persona, session_id, context, was_silent,
             )
         except RouterError:
@@ -284,6 +300,16 @@ class CEOAgent:
             if active_persona == "clawra":
                 return "欸...我有點累了，讓我休息一下下好嗎？大概 15 分鐘後回來找你 💤"
             return "Sir, 系統需要短暫休息。預計 15 分鐘後恢復，屆時我會主動通知您。"
+
+        # Clawra: force simplified → traditional Chinese conversion
+        if active_persona == "clawra" and _s2t is not None:
+            if isinstance(result, dict):
+                if "text" in result and isinstance(result["text"], str):
+                    result["text"] = _force_traditional_chinese(result["text"])
+            elif isinstance(result, str):
+                result = _force_traditional_chinese(result)
+
+        return result
 
     # ── Phase 2: Agent SDK helpers ──────────────────────────────
 
@@ -528,6 +554,9 @@ class CEOAgent:
         )
         reply = _clean_llm_reply(response.content)
 
+        # Record token usage for pool balancing
+        self._record_token_usage(response)
+
         # 5b. Reactive fallback: if LLM outputs [FETCH:]/[SEARCH:]/[MAPS:], execute
         # Loop up to 3 rounds to handle multiple tool calls
         for _tool_round in range(3):
@@ -586,7 +615,12 @@ class CEOAgent:
 
         # Patch T+: Pre-compaction flush — extract important info before discard
         if self._compressor.has_pending_flush:
-            asyncio.create_task(self._compressor.flush_pending())
+            async def _safe_flush():
+                try:
+                    await self._compressor.flush_pending()
+                except Exception as e:
+                    logger.warning(f"Pre-flush failed: {e}")
+            asyncio.create_task(_safe_flush())
 
         # J2+J3: Soul growth — learn from conversation
         reply_str = reply if isinstance(reply, str) else str(reply)
@@ -595,15 +629,18 @@ class CEOAgent:
                 insight = self._soul_growth.maybe_learn(active_persona, user_message, reply_str)
                 if insight and self.soul:
                     self.soul.reload_growth(active_persona)
+                    logger.info(f"SoulGrowth [{active_persona}]: learned and reloaded")
             except Exception as e:
-                logger.debug(f"Soul growth failed: {e}")
+                logger.warning(f"Soul growth error: {e}")
 
         # J4: Shared memory — check for memorable moments (Clawra only)
         if active_persona == "clawra" and self._shared_memory:
             try:
-                self._shared_memory.check_and_remember(user_message, reply_str)
+                moment = self._shared_memory.check_and_remember(user_message, reply_str)
+                if moment:
+                    logger.info(f"SharedMemory: recorded moment — {moment[:50]}")
             except Exception as e:
-                logger.debug(f"Shared memory failed: {e}")
+                logger.warning(f"Shared memory error: {e}")
 
         # K3: Booking result — attach phone/booking_url for Telegram
         if _booking_phone or _booking_url:
@@ -904,7 +941,18 @@ class CEOAgent:
                                 extra_kwargs["growth_content"] = self.soul.get_growth_content("clawra") or ""
                             from workers.selfie_worker import detect_framing
                             extra_kwargs["framing"] = detect_framing(user_message)
-                        result = await self.skills.invoke(skill_name, scene=user_message, **extra_kwargs)
+                        # 45s hard timeout — prevent fal.ai hang from blocking entire reply
+                        result = await asyncio.wait_for(
+                            self.skills.invoke(skill_name, scene=user_message, **extra_kwargs),
+                            timeout=45.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Skill '{skill_name}' timed out (45s)")
+                        self._last_skill_failure = (
+                            "拍照暫時失敗了（可能手機沒電、光線不好、在忙），"
+                            "用符合角色的方式自然帶過，絕對不要提到系統、API、技術問題"
+                        )
+                        return None
                     except Exception as e:
                         logger.warning(f"Skill '{skill_name}' failed: {e}")
                         self._last_skill_failure = f"「{skill_name}」功能暫時無法使用，用符合角色的方式自然回應，絕對不要提到系統、AI、技術錯誤"
@@ -1024,7 +1072,8 @@ class CEOAgent:
                     if content:
                         limit = _FETCH_CHAR_LIMIT if query_or_url.startswith("http") else _SEARCH_CHAR_LIMIT
                         return str(content)[:limit]
-                elif not task_result.success and self.pending:
+                    return None
+                if not task_result.success and self.pending:
                     self.pending.add("web_search", query_or_url, url=query_or_url)
                 return None
             except Exception as e:
@@ -1346,8 +1395,9 @@ class CEOAgent:
             base = (
                 "你是 J.A.R.V.I.S.，Ted 的 AI 管家。"
                 "結論先行，回覆不超過 500 Token。"
-                f"\n{extra}" if extra else ""
             )
+            if extra:
+                base += f"\n{extra}"
 
         # Append tool-use instructions if browser worker available
         if self.workers.get("browser"):
@@ -1612,3 +1662,18 @@ class CEOAgent:
             return json.loads(self.PENDING_SELFIE_PATH.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return []
+
+    @staticmethod
+    def _record_token_usage(response: ChatResponse) -> None:
+        """Record token usage for model pool balancing."""
+        try:
+            from core.model_balancer import record_usage
+            model = response.model
+            usage = response.usage
+            total = usage.get("total_tokens", 0)
+            if not total:
+                # Estimate from content length
+                total = int(len(response.content) * 1.5) + 200
+            record_usage(model, total)
+        except Exception:
+            pass  # non-critical

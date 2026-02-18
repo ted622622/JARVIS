@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -28,35 +29,26 @@ logger = logging.getLogger(__name__)
 # ─── Environment preparation ─────────────────────────────────────
 
 
-def _prepare_env() -> None:
-    """Set env vars for Agent SDK, clear nested session markers."""
-    # Prevent nested Claude Code session error
+@contextlib.contextmanager
+def _agent_env():
+    """Temporarily set Agent SDK env vars, restore on exit."""
+    # Clear nested session markers
+    cleared = {}
     for key in ("CLAUDECODE", "CLAUDE_CODE_ENTRY_POINT",
                 "CLAUDE_CODE_SESSION_ID"):
-        os.environ.pop(key, None)
+        cleared[key] = os.environ.pop(key, None)
 
-    # Map ZHIPU_API_KEY → ANTHROPIC_API_KEY (Agent SDK expects this)
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        zhipu_key = os.environ.get("ZHIPU_API_KEY", "")
-        if zhipu_key:
-            os.environ["ANTHROPIC_API_KEY"] = zhipu_key
-
-    if not os.environ.get("ANTHROPIC_BASE_URL"):
-        os.environ["ANTHROPIC_BASE_URL"] = (
-            "https://open.bigmodel.cn/api/anthropic"
-        )
-
-    os.environ.setdefault("API_TIMEOUT_MS", "3000000")
-
-    # Model tier env vars for Agent SDK
-    os.environ.setdefault(
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        os.environ.get("ZHIPU_CEO_MODEL", "glm-4.6v"),
-    )
-    os.environ.setdefault(
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        os.environ.get("ZHIPU_LITE_MODEL", "glm-4.5-air"),
-    )
+    env_map = {
+        "ANTHROPIC_API_KEY": os.environ.get("ZHIPU_API_KEY", ""),
+        "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+        "API_TIMEOUT_MS": "3000000",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": os.environ.get("ZHIPU_CEO_MODEL", "glm-4.6v"),
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": os.environ.get("ZHIPU_LITE_MODEL", "glm-4.6v"),
+    }
+    old: dict[str, str | None] = {}
+    for k, v in env_map.items():
+        old[k] = os.environ.get(k)
+        os.environ[k] = v
 
     # Windows UTF-8 safety
     if sys.platform == "win32":
@@ -65,6 +57,18 @@ def _prepare_env() -> None:
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for k, v in cleared.items():
+            if v is not None:
+                os.environ[k] = v
 
 
 # ─── Tier configuration ──────────────────────────────────────────
@@ -157,7 +161,6 @@ class AgentExecutor:
     DAILY_LIMIT = 200_000  # tokens per day
 
     def __init__(self, jarvis_root: str | None = None):
-        _prepare_env()
         self._root = jarvis_root or str(
             Path(__file__).parent.parent.resolve()
         )
@@ -238,16 +241,17 @@ class AgentExecutor:
 
             async def _run() -> None:
                 nonlocal response_text, tool_count
-                async for msg in query(prompt=full_prompt, options=options):
-                    if isinstance(msg, AssistantMessage):
-                        for block in msg.content:
-                            if isinstance(block, TextBlock):
-                                response_text += block.text
-                            elif isinstance(block, ToolUseBlock):
-                                tool_count += 1
-                    elif isinstance(msg, ResultMessage):
-                        if hasattr(msg, "result") and msg.result:
-                            response_text += str(msg.result)
+                with _agent_env():
+                    async for msg in query(prompt=full_prompt, options=options):
+                        if isinstance(msg, AssistantMessage):
+                            for block in msg.content:
+                                if isinstance(block, TextBlock):
+                                    response_text += block.text
+                                elif isinstance(block, ToolUseBlock):
+                                    tool_count += 1
+                        elif isinstance(msg, ResultMessage):
+                            if hasattr(msg, "result") and msg.result:
+                                response_text += str(msg.result)
 
             await asyncio.wait_for(_run(), timeout=config["timeout"])
 

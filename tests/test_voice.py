@@ -1036,7 +1036,7 @@ class TestZhipuTTS:
 
     @pytest.mark.asyncio
     async def test_zhipu_failure_azure_fallback(self, tmp_path):
-        """GLM-TTS fails → falls back to Azure."""
+        """GLM-TTS fails → falls back to Azure (Clawra path)."""
         worker = VoiceWorker(
             cache_dir=str(tmp_path),
             azure_key="azure-key",
@@ -1058,13 +1058,14 @@ class TestZhipuTTS:
         mock_client.is_closed = False
         worker._http_client = mock_client
 
-        path = await worker.text_to_speech("Hello", persona="jarvis")
+        # Only Clawra tries GLM-TTS; JARVIS skips it entirely
+        path = await worker.text_to_speech("Hello fallback", persona="clawra")
         assert Path(path).exists()
         assert mock_client.post.call_count == 2
 
     @pytest.mark.asyncio
     async def test_zhipu_azure_fail_edge_fallback(self, tmp_path):
-        """GLM-TTS + Azure both fail → falls back to edge-tts."""
+        """GLM-TTS + Azure both fail → falls back to edge-tts (Clawra path)."""
         worker = VoiceWorker(
             cache_dir=str(tmp_path),
             azure_key="azure-key",
@@ -1088,9 +1089,10 @@ class TestZhipuTTS:
 
         mock_communicate.save = fake_save
 
+        # Clawra exercises full chain: GLM-TTS → Azure → edge-tts
         with patch("workers.voice_worker.edge_tts") as mock_edge:
             mock_edge.Communicate.return_value = mock_communicate
-            path = await worker.text_to_speech("test", persona="jarvis")
+            path = await worker.text_to_speech("test edge fb", persona="clawra")
 
         assert Path(path).exists()
 
@@ -1253,50 +1255,9 @@ class TestTrimLeadingTone:
                 w.writeframes(data)
         return buf.getvalue()
 
-    def test_trims_single_tone(self):
-        # tone 120ms → silence → speech
-        raw = self._make_wav([(1794, 120), (0, 50), (100, 500)])
-        trimmed = VoiceWorker._trim_leading_tone(raw)
-        assert trimmed != raw
-        with wave.open(io.BytesIO(trimmed), "rb") as w:
-            # Should have removed 120ms tone + 20ms margin = 140ms
-            # Remaining: ~530ms of the original 670ms
-            assert w.getnframes() < 24000 * 670 / 1000
-
-    def test_trims_double_tone(self):
-        # Matches real GLM-TTS: tone → silence → tone → silence → speech
-        raw = self._make_wav([
-            (1794, 120),  # first tone
-            (0, 170),     # gap
-            (1794, 120),  # second tone
-            (0, 50),      # gap before speech
-            (100, 2000),  # actual speech
-        ])
-        trimmed = VoiceWorker._trim_leading_tone(raw)
-        with wave.open(io.BytesIO(trimmed), "rb") as w:
-            trimmed_dur = w.getnframes() / w.getframerate() * 1000
-        # Both tones removed: ~410ms of preamble gone, ~2050ms remains
-        assert trimmed_dur < 2100
-        assert trimmed_dur > 1900
-
-    def test_no_trim_if_no_tone(self):
-        # Normal audio — no tone detected, should return original
-        raw = self._make_wav([(100, 3000)])
-        trimmed = VoiceWorker._trim_leading_tone(raw)
-        assert trimmed == raw
-
-    def test_returns_raw_on_invalid_input(self):
-        bad = b"not a wav file"
-        result = VoiceWorker._trim_leading_tone(bad)
-        assert result == bad
-
-    def test_valid_wav_output(self):
-        raw = self._make_wav([(1794, 120), (0, 50), (100, 2000)])
-        trimmed = VoiceWorker._trim_leading_tone(raw)
-        with wave.open(io.BytesIO(trimmed), "rb") as w:
-            assert w.getnchannels() == 1
-            assert w.getsampwidth() == 2
-            assert w.getframerate() == 24000
+    def test_atrim_replaced_smart_scan(self):
+        """_trim_leading_tone removed; atrim=0.7 used in ffmpeg instead."""
+        assert not hasattr(VoiceWorker, "_trim_leading_tone")
 
 
 class TestClawraVoice:
@@ -1307,6 +1268,167 @@ class TestClawraVoice:
 
     def test_jarvis_voice_unchanged(self):
         assert ZHIPU_VOICE_MAP["jarvis"] == "chuichui"
+
+
+class TestGlmTtsClient:
+    """Tests for clients/glm_tts_client.py — official SDK wrapper."""
+
+    def test_not_available_without_key(self):
+        from clients.glm_tts_client import GlmTtsClient
+        client = GlmTtsClient(api_key="")
+        assert not client.is_available
+
+    def test_available_with_key(self):
+        from clients.glm_tts_client import GlmTtsClient
+        client = GlmTtsClient(api_key="test-key")
+        assert client.is_available
+
+    @pytest.mark.asyncio
+    async def test_synthesize_calls_sdk(self):
+        from clients.glm_tts_client import GlmTtsClient
+        client = GlmTtsClient(api_key="test-key")
+
+        mock_zhipu = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = b"\x00" * 1000
+        mock_zhipu.audio.speech.return_value = mock_response
+        client._client = mock_zhipu
+
+        result = await client.synthesize("hello", voice="tongtong")
+        assert result == b"\x00" * 1000
+        mock_zhipu.audio.speech.assert_called_once_with(
+            model="glm-tts",
+            input="hello",
+            voice="tongtong",
+            response_format="wav",
+            encode_format=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_synthesize_raises_when_unavailable(self):
+        from clients.glm_tts_client import GlmTtsClient
+        client = GlmTtsClient(api_key="")
+        with pytest.raises(RuntimeError, match="not available"):
+            await client.synthesize("hello")
+
+    def test_close(self):
+        from clients.glm_tts_client import GlmTtsClient
+        client = GlmTtsClient(api_key="test-key")
+        mock_zhipu = MagicMock()
+        client._client = mock_zhipu
+        client.close()
+        mock_zhipu.close.assert_called_once()
+        assert client._client is None
+
+
+class TestPersonaRouting:
+    """Clawra uses GLM-TTS, JARVIS skips it."""
+
+    @pytest.mark.asyncio
+    async def test_clawra_tries_glm_first(self, tmp_path):
+        """Clawra persona should attempt GLM-TTS before Azure."""
+        worker = VoiceWorker(cache_dir=str(tmp_path))
+
+        worker._zhipu_tts = AsyncMock(return_value=True)
+        worker._azure_tts = AsyncMock(return_value=True)
+        worker._edge_tts = AsyncMock(return_value=True)
+
+        await worker.text_to_speech("clawra glm test", persona="clawra")
+
+        worker._zhipu_tts.assert_called_once()
+        worker._azure_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_jarvis_skips_glm(self, tmp_path):
+        """JARVIS persona should NOT call GLM-TTS, go straight to Azure."""
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            azure_key="key",
+            azure_region="eastasia",
+        )
+
+        worker._zhipu_tts = AsyncMock(return_value=True)
+        worker._azure_tts = AsyncMock(return_value=True)
+        worker._edge_tts = AsyncMock(return_value=True)
+
+        await worker.text_to_speech("jarvis skip test", persona="jarvis")
+
+        worker._zhipu_tts.assert_not_called()
+        worker._azure_tts.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_clawra_falls_back_to_azure(self, tmp_path):
+        """When GLM-TTS fails, Clawra falls back to Azure."""
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            azure_key="key",
+            azure_region="eastasia",
+        )
+
+        worker._zhipu_tts = AsyncMock(return_value=False)
+        worker._azure_tts = AsyncMock(return_value=True)
+        worker._edge_tts = AsyncMock(return_value=True)
+
+        await worker.text_to_speech("clawra fallback test", persona="clawra")
+
+        worker._zhipu_tts.assert_called_once()
+        worker._azure_tts.assert_called_once()
+
+
+class TestGlmTtsWithSdkClient:
+    """Test _zhipu_tts method with SDK client vs httpx fallback."""
+
+    @pytest.mark.asyncio
+    async def test_uses_sdk_when_available(self, tmp_path):
+        """_zhipu_tts should use GlmTtsClient when available."""
+        mock_glm = AsyncMock()
+        mock_glm.is_available = True
+
+        # Return a valid WAV
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(b"\x00\x00" * 24000)  # 1s silence
+        mock_glm.synthesize = AsyncMock(return_value=buf.getvalue())
+
+        worker = VoiceWorker(cache_dir=str(tmp_path), glm_tts_client=mock_glm)
+        out = tmp_path / "test.ogg"
+
+        # Without ffmpeg, falls back to writing trimmed WAV
+        result = await worker._zhipu_tts("hello", "clawra", out)
+        assert result is True
+        mock_glm.synthesize.assert_called_once_with("hello", voice="tongtong")
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_httpx(self, tmp_path):
+        """When SDK client is None, uses httpx fallback."""
+        worker = VoiceWorker(
+            cache_dir=str(tmp_path),
+            zhipu_key="test-key",
+        )
+
+        # Mock httpx response
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(b"\x00\x00" * 24000)
+        mock_resp.content = buf.getvalue()
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.is_closed = False
+        worker._http_client = mock_http
+
+        out = tmp_path / "test.ogg"
+        result = await worker._zhipu_tts("hello", "clawra", out)
+        assert result is True
+        mock_http.post.assert_called_once()
 
 
 class TestSelfieDualMode:

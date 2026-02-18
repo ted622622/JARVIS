@@ -213,12 +213,25 @@ async def main() -> None:
     )
 
     voice_cache_dir = config.get("voice", {}).get("cache_dir", "./data/voice_cache")
+
+    # GLM-TTS via official zhipuai SDK (for Clawra persona)
+    glm_tts = None
+    zhipu_key = os.environ.get("ZHIPU_API_KEY", "")
+    if zhipu_key:
+        try:
+            from clients.glm_tts_client import GlmTtsClient
+            glm_tts = GlmTtsClient(api_key=zhipu_key)
+            logger.info("GLM-TTS client initialized (zhipuai SDK)")
+        except Exception as e:
+            logger.warning(f"GLM-TTS client init failed: {e}")
+
     voice_worker = VoiceWorker(
         cache_dir=voice_cache_dir,
         azure_key=os.environ.get("AZURE_SPEECH_KEY", ""),
         azure_region=os.environ.get("AZURE_SPEECH_REGION", ""),
-        zhipu_key=os.environ.get("ZHIPU_API_KEY", ""),
+        zhipu_key=zhipu_key,
         zhipu_voice=os.environ.get("ZHIPU_TTS_VOICE", "tongtong"),
+        glm_tts_client=glm_tts,
     )
 
     workers = {
@@ -379,6 +392,8 @@ async def main() -> None:
         gog_worker=gog_worker if gog_worker.is_available else None,
         reminder_manager=reminder_mgr,
         fal_client=fal_client,
+        soul=soul,
+        voice_worker=voice_worker,
     )
     heartbeat.start()
 

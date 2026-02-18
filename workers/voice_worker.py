@@ -1,8 +1,7 @@
 """Voice Worker — TTS for J.A.R.V.I.S. and Clawra.
 
-Primary: 智譜 GLM-TTS (context-aware emotion, GRPO-optimized)
-Fallback 1: Azure Speech (SSML, natural prosody)
-Fallback 2: edge-tts (free, unlimited)
+Clawra: GLM-TTS (via zhipuai SDK) → Azure Speech → edge-tts
+JARVIS: Azure Speech → edge-tts (no GLM-TTS)
 
 Each persona has a distinct voice, speaking rate, and style.
 """
@@ -11,11 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import html
-import io
 import re
-import struct
 import subprocess
-import wave
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +79,7 @@ class VoiceWorker:
         azure_region: str = "",
         zhipu_key: str = "",
         zhipu_voice: str = "tongtong",
+        glm_tts_client: Any = None,
     ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -91,6 +88,7 @@ class VoiceWorker:
         self.azure_region = azure_region
         self.zhipu_key = zhipu_key
         self.zhipu_voice = zhipu_voice
+        self._glm_client = glm_tts_client
         self._http_client: httpx.AsyncClient | None = None
 
     async def _get_http_client(self) -> httpx.AsyncClient:
@@ -135,89 +133,72 @@ class VoiceWorker:
             "</voice></speak>"
         )
 
-    @staticmethod
-    def _trim_leading_tone(
-        raw_wav: bytes,
-        tone_threshold: int = 500,
-        scan_limit_ms: int = 800,
-    ) -> bytes:
-        """Remove GLM-TTS leading tones from WAV audio.
-
-        GLM-TTS embeds multiple ~120 ms constant-amplitude tone bursts
-        (max ~1794, avg ~1137) before the actual speech begins.  Pattern:
-        tone → silence → tone → silence → speech.
-
-        Strategy: scan the first *scan_limit_ms* in 10 ms windows.
-        Find the last window whose average absolute amplitude exceeds
-        *tone_threshold*, then trim everything up to and including that
-        window (plus a small 20 ms margin).
-
-        Returns cleaned WAV bytes.  On any error, returns the original.
-        """
-        try:
-            src = wave.open(io.BytesIO(raw_wav), "rb")
-            framerate = src.getframerate()
-            n_channels = src.getnchannels()
-            sampwidth = src.getsampwidth()
-            n_frames = src.getnframes()
-
-            if sampwidth != 2:
-                src.close()
-                return raw_wav  # only handle 16-bit PCM
-
-            window_frames = int(framerate * 0.01)  # 10 ms
-            max_windows = int(scan_limit_ms / 10)
-            scan_windows = min(max_windows, n_frames // window_frames)
-
-            last_tone_end = 0  # frame index past the last tone window
-            for i in range(scan_windows):
-                chunk = src.readframes(window_frames)
-                samples = struct.unpack(f"<{len(chunk) // 2}h", chunk)
-                avg_abs = sum(abs(s) for s in samples) // len(samples)
-                if avg_abs > tone_threshold:
-                    last_tone_end = (i + 1) * window_frames
-
-            if last_tone_end == 0:
-                src.close()
-                return raw_wav  # no tone detected — keep as-is
-
-            # Add 20 ms margin after last tone
-            margin_frames = int(framerate * 0.02)
-            skip_frames = min(last_tone_end + margin_frames, n_frames)
-
-            # Re-open and skip to the cut point
-            src.close()
-            src = wave.open(io.BytesIO(raw_wav), "rb")
-            src.readframes(skip_frames)
-            remaining = src.readframes(n_frames - skip_frames)
-            src.close()
-
-            if not remaining:
-                return raw_wav  # nothing left after trim
-
-            buf = io.BytesIO()
-            with wave.open(buf, "wb") as dst:
-                dst.setnchannels(n_channels)
-                dst.setsampwidth(sampwidth)
-                dst.setframerate(framerate)
-                dst.writeframes(remaining)
-
-            logger.debug(
-                f"WAV tone trim: removed first {skip_frames/framerate*1000:.0f}ms "
-                f"({skip_frames} frames)"
-            )
-            return buf.getvalue()
-        except Exception as e:
-            logger.debug(f"WAV trim skipped ({e}), using raw")
-            return raw_wav
-
     async def _zhipu_tts(self, text: str, persona: str, out_path: Path) -> bool:
-        """Generate speech via Zhipu GLM-TTS REST API. Returns True on success."""
-        if not self.zhipu_key:
+        """Generate speech via Zhipu GLM-TTS. Returns True on success.
+
+        Uses official zhipuai SDK (GlmTtsClient) when available,
+        falls back to raw httpx REST call otherwise.
+
+        GLM-TTS embeds ~100Hz tone bursts in the first ~650ms (model behavior).
+        We skip the first 700ms via ffmpeg atrim — simple, reliable, no scan needed.
+        """
+        voice = ZHIPU_VOICE_MAP.get(persona, self.zhipu_voice)
+
+        # Acquire raw WAV bytes — SDK path or httpx fallback
+        raw_wav: bytes | None = None
+
+        if self._glm_client and getattr(self._glm_client, "is_available", False):
+            try:
+                raw_wav = await self._glm_client.synthesize(text, voice=voice)
+            except Exception as e:
+                logger.warning(f"GLM-TTS SDK error: {e}")
+        elif self.zhipu_key:
+            raw_wav = await self._zhipu_tts_httpx(text, voice)
+
+        if not raw_wav:
             return False
 
+        # WAV → OGG/OPUS with atrim to skip leading tone bursts
+        if _HAS_FFMPEG:
+            tmp_wav = out_path.with_suffix(".tmp.wav")
+            try:
+                tmp_wav.write_bytes(raw_wav)
+                result = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", str(tmp_wav),
+                        "-af", (
+                            "atrim=start=1.8,"          # skip first 1800ms (4 tone bursts end ~1760ms)
+                            "afade=t=in:d=0.03,"         # 30ms fade-in
+                            "asetpts=PTS-STARTPTS"        # reset timestamps
+                        ),
+                        "-codec:a", "libopus", "-b:a", "64k",
+                        "-ar", "48000", "-ac", "1",
+                        str(out_path),
+                    ],
+                    capture_output=True, timeout=15,
+                )
+                if result.returncode != 0:
+                    logger.warning(f"ffmpeg WAV→OGG failed: {result.stderr[:200]}")
+                    out_path.write_bytes(raw_wav)
+            finally:
+                tmp_wav.unlink(missing_ok=True)
+        else:
+            out_path.write_bytes(raw_wav)
+
+        size = out_path.stat().st_size
+        if size == 0:
+            out_path.unlink(missing_ok=True)
+            return False
+
+        logger.info(f"GLM-TTS: {out_path.name} ({size} bytes)")
+        return True
+
+    async def _zhipu_tts_httpx(self, text: str, voice: str) -> bytes | None:
+        """Fallback: GLM-TTS via raw httpx (when SDK unavailable)."""
+        if not self.zhipu_key:
+            return None
+
         client = await self._get_http_client()
-        voice = ZHIPU_VOICE_MAP.get(persona, self.zhipu_voice)
         body: dict[str, Any] = {
             "model": "glm-tts",
             "input": text,
@@ -234,53 +215,14 @@ class VoiceWorker:
             )
             if resp.status_code != 200:
                 logger.warning(
-                    f"GLM-TTS failed ({resp.status_code}): "
+                    f"GLM-TTS httpx failed ({resp.status_code}): "
                     f"{resp.text[:200] if resp.text else 'no body'}"
                 )
-                return False
-
-            # GLM-TTS returns WAV with a ~120ms tone/beep at the start
-            # (baked into the PCM data by the model).  We trim it, then
-            # convert WAV → MP3 via ffmpeg for Telegram compatibility.
-            raw_wav = resp.content
-            trimmed_wav = self._trim_leading_tone(raw_wav)
-
-            if _HAS_FFMPEG:
-                tmp_wav = out_path.with_suffix(".tmp.wav")
-                try:
-                    tmp_wav.write_bytes(trimmed_wav)
-                    # Convert to OGG/OPUS (Telegram native voice format)
-                    # + 50ms fade-in as safety net against any residual click
-                    result = subprocess.run(
-                        [
-                            "ffmpeg", "-y", "-i", str(tmp_wav),
-                            "-af", "afade=in:st=0:d=0.05",
-                            "-codec:a", "libopus", "-b:a", "64k",
-                            "-ar", "48000", str(out_path),
-                        ],
-                        capture_output=True, timeout=15,
-                    )
-                    if result.returncode != 0:
-                        logger.warning(f"ffmpeg WAV→OGG failed: {result.stderr[:200]}")
-                        out_path.write_bytes(trimmed_wav)
-                finally:
-                    tmp_wav.unlink(missing_ok=True)
-            else:
-                # No ffmpeg — write trimmed WAV directly
-                out_path.write_bytes(trimmed_wav)
-
-            size = out_path.stat().st_size
-            if size == 0:
-                out_path.unlink(missing_ok=True)
-                return False
-
-            logger.info(f"GLM-TTS: {out_path.name} ({size} bytes)")
-            return True
-
+                return None
+            return resp.content
         except Exception as e:
-            logger.warning(f"GLM-TTS error: {e}")
-            out_path.unlink(missing_ok=True)
-            return False
+            logger.warning(f"GLM-TTS httpx error: {e}")
+            return None
 
     async def _azure_tts(self, text: str, persona: str, out_path: Path) -> bool:
         """Generate speech via Azure Speech REST API. Returns True on success."""
@@ -365,7 +307,9 @@ class VoiceWorker:
     ) -> str:
         """Generate audio from text.
 
-        Three-tier fallback: GLM-TTS (OGG/OPUS) → Azure Speech (MP3) → edge-tts (MP3).
+        Persona-based routing:
+          Clawra: GLM-TTS (OGG/OPUS) → Azure Speech (MP3) → edge-tts (MP3)
+          JARVIS: Azure Speech (MP3) → edge-tts (MP3)
 
         Returns:
             Path to the generated audio file
@@ -373,26 +317,25 @@ class VoiceWorker:
         Raises:
             VoiceError: If all TTS engines fail
         """
-        # Clean text for TTS (remove emoji, action words)
         text = VoiceTextCleaner.clean(text)
 
         if not text.strip():
             raise VoiceError("Empty text provided for TTS")
 
-        # GLM-TTS outputs OGG/OPUS (Telegram native), fallbacks output MP3
         ogg_path = self._cache_path(text, persona, ext=".ogg")
         mp3_path = self._cache_path(text, persona, ext=".mp3")
 
-        # Return cached version if exists and non-empty (either format)
         for cached in (ogg_path, mp3_path):
             if cached.exists() and cached.stat().st_size > 0:
                 logger.debug(f"TTS cache hit: {cached.name}")
                 return str(cached)
 
-        # Three-tier fallback: GLM-TTS (WAV→OGG) → Azure (MP3) → edge-tts (MP3)
-        if await self._zhipu_tts(text, persona, ogg_path):
-            return str(ogg_path)
+        # Clawra: GLM-TTS first (Chinese female voice, more natural for her persona)
+        if persona == "clawra":
+            if await self._zhipu_tts(text, persona, ogg_path):
+                return str(ogg_path)
 
+        # Both personas: Azure → edge-tts fallback
         if await self._azure_tts(text, persona, mp3_path):
             return str(mp3_path)
 
@@ -416,6 +359,8 @@ class VoiceWorker:
         if self._http_client and not self._http_client.is_closed:
             await self._http_client.aclose()
             self._http_client = None
+        if self._glm_client and hasattr(self._glm_client, "close"):
+            self._glm_client.close()
 
 
 class VoiceTextCleaner:

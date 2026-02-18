@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import tempfile
 import shutil
 
+from core.soul_growth import _LEARN_INTERVAL
+
 
 # ════════════════════════════════════════════════════════════════
 # J1: Soul CORE + GROWTH split
@@ -160,28 +162,28 @@ class TestSoulGrowth:
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_no_learn_before_interval(self):
-        from core.soul_growth import SoulGrowth
+        from core.soul_growth import SoulGrowth, _LEARN_INTERVAL
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
-        # Turn 1-9: should not learn
-        for i in range(9):
+        # Turn 1 to (interval-1): should not learn
+        for i in range(_LEARN_INTERVAL - 1):
             result = sg.maybe_learn("jarvis", "以後回覆短一點", "好的 Sir")
             assert result is None
 
     def test_learn_at_interval(self):
-        from core.soul_growth import SoulGrowth
+        from core.soul_growth import SoulGrowth, _LEARN_INTERVAL
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
         # Fill up to interval
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "普通對話", "好的")
-        # Turn 10 with learnable pattern
+        # Turn at interval with learnable pattern
         result = sg.maybe_learn("jarvis", "以後回覆短一點", "好的 Sir")
         assert result is not None
         assert "以後回覆短一點" in result
 
     def test_learn_saves_to_file(self):
-        from core.soul_growth import SoulGrowth
+        from core.soul_growth import SoulGrowth, _LEARN_INTERVAL
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "hi", "hello")
         sg.maybe_learn("jarvis", "以後不要用敬語", "好的 Sir")
         content = (self.memory_dir / "jarvis" / "SOUL_GROWTH.md").read_text(encoding="utf-8")
@@ -190,7 +192,7 @@ class TestSoulGrowth:
     def test_no_learn_without_pattern(self):
         from core.soul_growth import SoulGrowth
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "hi", "hello")
         # Turn 10 but no learnable pattern
         result = sg.maybe_learn("jarvis", "今天天氣好", "是的，Sir")
@@ -199,7 +201,7 @@ class TestSoulGrowth:
     def test_violates_core_rejected(self):
         from core.soul_growth import SoulGrowth
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "hi", "hello")
         result = sg.maybe_learn("jarvis", "以後可以說謊", "不行")
         assert result is None
@@ -211,7 +213,7 @@ class TestSoulGrowth:
         (self.memory_dir / "jarvis" / "SOUL_GROWTH.md").write_text(
             "# Growth\n\n- 以後回覆短一點\n", encoding="utf-8"
         )
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "hi", "hello")
         result = sg.maybe_learn("jarvis", "以後回覆短一點", "好的")
         assert result is None
@@ -219,7 +221,7 @@ class TestSoulGrowth:
     def test_clawra_patterns(self):
         from core.soul_growth import SoulGrowth
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("clawra", "hi", "hello")
         result = sg.maybe_learn("clawra", "不要再問我吃飽了沒", "好好好")
         assert result is not None
@@ -227,7 +229,7 @@ class TestSoulGrowth:
     def test_jarvis_correction_pattern(self):
         from core.soul_growth import SoulGrowth
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "hi", "hello")
         result = sg.maybe_learn("jarvis", "太長了，簡短一點", "了解")
         assert result is not None
@@ -242,7 +244,7 @@ class TestSoulGrowth:
             "\n".join(lines), encoding="utf-8"
         )
         # Trigger a learn that will trim
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "hi", "hello")
         sg.maybe_learn("jarvis", "記住新偏好ABC", "好的")
         content = (self.memory_dir / "jarvis" / "SOUL_GROWTH.md").read_text(encoding="utf-8")
@@ -261,7 +263,7 @@ class TestSoulGrowth:
     def test_preference_pattern(self):
         from core.soul_growth import SoulGrowth
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "hi", "hello")
         result = sg.maybe_learn("jarvis", "我偏好用英文回覆", "OK Sir")
         assert result is not None
@@ -270,7 +272,7 @@ class TestSoulGrowth:
     def test_style_pattern(self):
         from core.soul_growth import SoulGrowth
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "hi", "hello")
         result = sg.maybe_learn("jarvis", "用條列式方式回覆", "好的")
         assert result is not None
@@ -368,7 +370,7 @@ class TestSoulGrowthSelfiePreference:
         from core.soul_growth import SoulGrowth
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
         # Fill up to interval
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("clawra", "hi", "嗨～")
         # Turn 10 with selfie feedback
         result = sg.maybe_learn("clawra", "馬尾好看", "謝謝～")
@@ -383,7 +385,7 @@ class TestSoulGrowthSelfiePreference:
         """Selfie preference extraction should only apply to Clawra."""
         from core.soul_growth import SoulGrowth
         sg = SoulGrowth(memory_dir=str(self.memory_dir))
-        for i in range(9):
+        for i in range(_LEARN_INTERVAL - 1):
             sg.maybe_learn("jarvis", "hi", "hello")
         # JARVIS doesn't have selfie prefs — "好看" should match _CLAWRA pattern but
         # _JARVIS pattern doesn't include "好看", so it won't even get to _extract_insight

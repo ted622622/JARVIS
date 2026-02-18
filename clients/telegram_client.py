@@ -349,13 +349,13 @@ class TelegramClient:
     ) -> None:
         """Simulate human typing delay for Clawra persona.
 
-        Delay is 15–60 seconds, scaled by response length.
+        Delay is 5–45 seconds, scaled by response length.
         Sends 'typing' chat action every 4s so the indicator stays visible.
         """
-        # ~0.3s per character, clamped to [15, 60], with a small random jitter
-        base = min(15 + len(text) * 0.3, 60)
-        delay = base + random.uniform(-3, 3)
-        delay = max(15, min(delay, 60))
+        # ~0.3s per character, clamped to [5, 45], with a small random jitter
+        base = min(5 + len(text) * 0.3, 45)
+        delay = base + random.uniform(-2, 2)
+        delay = max(5, min(delay, 45))
         logger.debug(f"Clawra typing delay: {delay:.1f}s for {len(text)} chars")
 
         elapsed = 0.0
@@ -635,15 +635,31 @@ class TelegramClient:
             emotion = None
             phone = None
             booking_url = None
+            photo_url = None
             reply_mode = None
             if isinstance(reply, dict):
                 reply_text = reply.get("text", "")
                 emotion = reply.get("emotion")
                 phone = reply.get("phone")
                 booking_url = reply.get("booking_url")
+                photo_url = reply.get("photo_url")
                 reply_mode = reply.get("reply_mode")
             else:
                 reply_text = reply or ""
+
+            # Selfie photo — send photo with caption, skip TTS
+            if photo_url:
+                try:
+                    bot = update.message.get_bot()
+                    await bot.send_photo(
+                        chat_id=chat_id, photo=photo_url,
+                        caption=reply_text or None,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send photo via voice handler: {e}")
+                    if reply_text:
+                        await update.message.reply_text(reply_text)
+                return
 
             if not reply_text:
                 return

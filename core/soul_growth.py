@@ -22,7 +22,7 @@ from loguru import logger
 
 
 # Minimum turns between learning attempts
-_LEARN_INTERVAL = 10
+_LEARN_INTERVAL = 3
 
 # Maximum entries in SOUL_GROWTH.md
 _MAX_GROWTH_ENTRIES = 50
@@ -129,11 +129,13 @@ class SoulGrowth:
         self._turn_counts[persona] = count
 
         if count < _LEARN_INTERVAL:
+            logger.debug(f"SoulGrowth [{persona}]: turn {count}/{_LEARN_INTERVAL}, waiting")
             return None
 
         # Check if message contains learnable patterns
         pattern = _JARVIS_LEARN_PATTERNS if persona == "jarvis" else _CLAWRA_LEARN_PATTERNS
         if not pattern.search(user_msg):
+            logger.debug(f"SoulGrowth [{persona}]: no pattern match in: {user_msg[:50]}")
             return None
 
         # Extract the insight

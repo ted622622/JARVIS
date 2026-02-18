@@ -70,6 +70,7 @@ class SharedMemory:
         Returns the saved moment description, or None.
         """
         if not _MEMORABLE_PATTERNS.search(user_msg):
+            logger.debug(f"SharedMemory: no memorable pattern in: {user_msg[:50]}")
             return None
 
         moment = self._extract_moment(user_msg, assistant_msg)

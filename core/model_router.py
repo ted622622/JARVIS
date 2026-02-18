@@ -99,11 +99,20 @@ class ModelRouter:
         """Select the appropriate Zhipu model based on task type.
 
         - "template", "format", "cron_message": lightweight tasks → ZHIPU_LITE_MODEL
-        - Everything else (including "ceo"): full reasoning → ZHIPU_CEO_MODEL
+        - Everything else (including "ceo"): auto-balance 4.6V/4.7 via model_balancer
         """
         if task_type in ("template", "format", "cron_message"):
-            return os.getenv("ZHIPU_LITE_MODEL", "glm-4.5-air")
-        return os.getenv("ZHIPU_CEO_MODEL", "glm-4.6v")
+            return os.getenv("ZHIPU_LITE_MODEL", "glm-4.6v")
+
+        # CEO: auto-balance between 4.6V and 4.7 pools
+        ceo_env = os.getenv("ZHIPU_CEO_MODEL", "auto")
+        if ceo_env == "auto":
+            try:
+                from core.model_balancer import select_model as _bal_select
+                return _bal_select()
+            except Exception:
+                return "glm-4.6v"
+        return ceo_env
 
     def _get_chain_for_role(
         self, role: ModelRole, task_type: str = "ceo",

@@ -436,31 +436,30 @@ class TestTelegramClient:
 
     @pytest.mark.asyncio
     async def test_typing_delay_clawra_short_text(self):
-        """Typing delay should be at least 12s (15 - 3 jitter)."""
+        """Typing delay should be at least 3s (5 - 2 jitter)."""
         from clients.telegram_client import TelegramClient
         client = TelegramClient()
         mock_bot = AsyncMock()
 
-        start = time.monotonic()
         # Patch asyncio.sleep to skip actual waiting
         with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             await client._simulate_typing(mock_bot, 123, "短訊息")
             total_delay = sum(call.args[0] for call in mock_sleep.call_args_list)
-            assert 12 <= total_delay <= 60
+            assert 3 <= total_delay <= 47
             mock_bot.send_chat_action.assert_called()
 
     @pytest.mark.asyncio
     async def test_typing_delay_clawra_long_text(self):
-        """Long text should push delay toward 60s cap."""
+        """Long text should push delay toward 45s cap."""
         from clients.telegram_client import TelegramClient
         client = TelegramClient()
         mock_bot = AsyncMock()
 
-        long_text = "很長的回覆" * 50  # 150 chars → 15 + 150*0.3 = 60, capped
+        long_text = "很長的回覆" * 50  # 250 chars → 5 + 250*0.3 = 80, capped at 45
         with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             await client._simulate_typing(mock_bot, 123, long_text)
             total_delay = sum(call.args[0] for call in mock_sleep.call_args_list)
-            assert 50 <= total_delay <= 63  # near cap with jitter
+            assert 38 <= total_delay <= 47  # near cap with jitter
 
     @pytest.mark.asyncio
     async def test_typing_action_sent_periodically(self):
@@ -1331,3 +1330,263 @@ class TestPendingSelfieCheck:
 
         call_kwargs = mock_telegram.send_photo.call_args
         assert "Sir" in str(call_kwargs)
+
+
+# ── Clawra Proactive Behavior Tests ──────────────────────────────
+
+
+class TestClawraProactive:
+    """Tests for Clawra's proactive behavior system."""
+
+    @pytest.fixture
+    def mock_soul(self):
+        soul = MagicMock()
+        soul.build_system_prompt = MagicMock(return_value="你叫 Clawra，是 Ted 的女朋友")
+        return soul
+
+    @pytest.fixture
+    def clawra_hb(self, mock_router, mock_telegram, mock_soul):
+        hb = Heartbeat(
+            model_router=mock_router,
+            telegram=mock_telegram,
+            soul=mock_soul,
+        )
+        return hb
+
+    @pytest.mark.asyncio
+    async def test_clawra_jobs_registered(self, clawra_hb):
+        """With soul + telegram, 4 Clawra jobs are added."""
+        clawra_hb.start()
+        job_ids = [j["id"] for j in clawra_hb.get_jobs()]
+        assert "clawra_morning" in job_ids
+        assert "clawra_daily_share" in job_ids
+        assert "clawra_evening" in job_ids
+        assert "clawra_missing_check" in job_ids
+        clawra_hb.stop()
+
+    @pytest.mark.asyncio
+    async def test_no_clawra_jobs_without_soul(self, mock_telegram):
+        """Without soul, no Clawra jobs."""
+        hb = Heartbeat(telegram=mock_telegram)
+        hb.start()
+        job_ids = [j["id"] for j in hb.get_jobs()]
+        assert "clawra_morning" not in job_ids
+        hb.stop()
+
+    def test_clawra_can_send_quiet_hours(self, clawra_hb):
+        """During quiet hours (0-7), sending is blocked."""
+        from unittest.mock import patch as mock_patch
+        from datetime import datetime as dt
+        # 3 AM — quiet hours
+        fake_now = dt(2026, 2, 18, 3, 0, 0)
+        with mock_patch("core.heartbeat.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.side_effect = lambda *a, **kw: dt(*a, **kw)
+            assert clawra_hb._clawra_can_send() is False
+
+    def test_clawra_can_send_normal_hours(self, clawra_hb):
+        """During normal hours, sending is allowed."""
+        from unittest.mock import patch as mock_patch
+        from datetime import datetime as dt
+        fake_now = dt(2026, 2, 18, 10, 0, 0)
+        with mock_patch("core.heartbeat.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.side_effect = lambda *a, **kw: dt(*a, **kw)
+            assert clawra_hb._clawra_can_send() is True
+
+    def test_clawra_daily_limit(self, clawra_hb):
+        """After _CLAWRA_MAX_DAILY sends, further sends are blocked."""
+        from unittest.mock import patch as mock_patch
+        from datetime import datetime as dt
+        from core.heartbeat import _CLAWRA_MAX_DAILY
+        fake_now = dt(2026, 2, 18, 12, 0, 0)
+        with mock_patch("core.heartbeat.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.side_effect = lambda *a, **kw: dt(*a, **kw)
+            # Simulate sending max daily messages
+            clawra_hb._clawra_daily_date = "2026-02-18"
+            clawra_hb._clawra_daily_count = _CLAWRA_MAX_DAILY
+            clawra_hb._clawra_last_sent = 0  # no cooldown issue
+            assert clawra_hb._clawra_can_send() is False
+
+    def test_clawra_cooldown(self, clawra_hb):
+        """Cooldown blocks sending within 1 hour of last message."""
+        from unittest.mock import patch as mock_patch
+        from datetime import datetime as dt
+        fake_now = dt(2026, 2, 18, 12, 0, 0)
+        with mock_patch("core.heartbeat.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.side_effect = lambda *a, **kw: dt(*a, **kw)
+            clawra_hb._clawra_daily_date = "2026-02-18"
+            clawra_hb._clawra_daily_count = 0
+            clawra_hb._clawra_last_sent = time.time() - 600  # 10 min ago
+            assert clawra_hb._clawra_can_send() is False
+
+    def test_clawra_did_send_increments(self, clawra_hb):
+        """_clawra_did_send increments counter and sets timestamp."""
+        clawra_hb._clawra_daily_count = 0
+        clawra_hb._clawra_did_send()
+        assert clawra_hb._clawra_daily_count == 1
+        assert clawra_hb._clawra_last_sent > 0
+
+    @pytest.mark.asyncio
+    async def test_send_clawra_uses_clawra_bot(self, clawra_hb, mock_telegram):
+        """_send_clawra sends via telegram with persona='clawra'."""
+        await clawra_hb._send_clawra("你在幹嘛", voice_chance=0)
+        mock_telegram.send.assert_awaited_once()
+        call_kwargs = mock_telegram.send.call_args
+        assert call_kwargs[1]["persona"] == "clawra"
+
+    @pytest.mark.asyncio
+    async def test_compose_clawra_message_uses_soul(self, clawra_hb, mock_soul, mock_router):
+        """_compose_clawra_message uses soul prompt."""
+        mock_router.chat = AsyncMock(return_value=ChatResponse(content="欸 你在幹嘛", model="test"))
+        result = await clawra_hb._compose_clawra_message("男友很久沒找你了")
+        assert result is not None
+        mock_soul.build_system_prompt.assert_called_with("clawra")
+
+    @pytest.mark.asyncio
+    async def test_clawra_morning_blocked_by_limit(self, clawra_hb):
+        """When daily limit reached, morning greeting returns None."""
+        from unittest.mock import patch as mock_patch
+        from datetime import datetime as dt
+        from core.heartbeat import _CLAWRA_MAX_DAILY
+        fake_now = dt(2026, 2, 18, 8, 30, 0)
+        with mock_patch("core.heartbeat.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.side_effect = lambda *a, **kw: dt(*a, **kw)
+            clawra_hb._clawra_daily_date = "2026-02-18"
+            clawra_hb._clawra_daily_count = _CLAWRA_MAX_DAILY
+            result = await clawra_hb.clawra_morning()
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_clawra_missing_check_no_silence(self, clawra_hb, memos):
+        """When user was active recently, missing check does nothing."""
+        from unittest.mock import patch as mock_patch
+        from datetime import datetime as dt
+        fake_now = dt(2026, 2, 18, 14, 15, 0)
+        with mock_patch("core.heartbeat.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.side_effect = lambda *a, **kw: dt(*a, **kw)
+            clawra_hb.memos = memos
+            # User was active 30 min ago
+            await memos.working_memory.set("last_user_activity", time.time() - 1800, agent_id="test")
+            result = await clawra_hb.clawra_missing_check()
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_clawra_missing_check_triggers(self, clawra_hb, memos, mock_router, mock_telegram):
+        """When user silent for 5+ hours, missing check sends message."""
+        from unittest.mock import patch as mock_patch
+        from datetime import datetime as dt
+        mock_router.chat = AsyncMock(return_value=ChatResponse(content="你在幹嘛 怎麼都沒找我", model="test"))
+        fake_now = dt(2026, 2, 18, 14, 15, 0)
+        with mock_patch("core.heartbeat.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.side_effect = lambda *a, **kw: dt(*a, **kw)
+            clawra_hb.memos = memos
+            # User was active 5 hours ago
+            await memos.working_memory.set("last_user_activity", time.time() - 18000, agent_id="test")
+            result = await clawra_hb.clawra_missing_check()
+            assert result is not None
+            mock_telegram.send.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_daily_count_resets_on_new_day(self, clawra_hb):
+        """Daily count resets when date changes."""
+        from unittest.mock import patch as mock_patch
+        from datetime import datetime as dt
+        clawra_hb._clawra_daily_date = "2026-02-17"
+        clawra_hb._clawra_daily_count = 3
+        fake_now = dt(2026, 2, 18, 10, 0, 0)
+        with mock_patch("core.heartbeat.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.side_effect = lambda *a, **kw: dt(*a, **kw)
+            assert clawra_hb._clawra_can_send() is True
+            assert clawra_hb._clawra_daily_count == 0
+
+
+# ── S2T Filter Tests ──────────────────────────────────────────────
+
+
+class TestS2TFilter:
+    """Tests for simplified → traditional Chinese conversion in CEO agent."""
+
+    def test_force_traditional_chinese(self):
+        from core.ceo_agent import _force_traditional_chinese
+        result = _force_traditional_chinese("对啊没什么计划")
+        assert "對" in result
+        assert "沒" in result
+        assert "計劃" in result or "計畫" in result
+
+    def test_force_traditional_chinese_empty(self):
+        from core.ceo_agent import _force_traditional_chinese
+        assert _force_traditional_chinese("") == ""
+        assert _force_traditional_chinese(None) is None
+
+    def test_force_traditional_chinese_already_traditional(self):
+        from core.ceo_agent import _force_traditional_chinese
+        original = "你好嗎 今天天氣很好"
+        result = _force_traditional_chinese(original)
+        assert result == original
+
+    def test_force_traditional_chinese_mixed(self):
+        from core.ceo_agent import _force_traditional_chinese
+        result = _force_traditional_chinese("欸 没什么啦 计划都取消了")
+        assert "沒" in result
+        assert "計" in result
+
+
+class TestSoulGrowthLowerThreshold:
+    """Tests for SoulGrowth learning with lowered interval."""
+
+    def test_learn_interval_is_3(self):
+        from core.soul_growth import _LEARN_INTERVAL
+        assert _LEARN_INTERVAL == 3
+
+    def test_maybe_learn_before_interval(self, tmp_path):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(tmp_path))
+        # First 2 turns should return None (interval=3)
+        assert sg.maybe_learn("clawra", "以後不要這樣", "好的") is None
+        assert sg.maybe_learn("clawra", "以後不要那樣", "好的") is None
+        # 3rd turn with matching pattern should learn
+        result = sg.maybe_learn("clawra", "以後不要再遲到了", "好的我記住了")
+        assert result is not None
+
+    def test_growth_file_created(self, tmp_path):
+        from core.soul_growth import SoulGrowth
+        sg = SoulGrowth(memory_dir=str(tmp_path))
+        # Exhaust interval
+        for _ in range(2):
+            sg.maybe_learn("clawra", "hello", "hi")
+        # Now trigger learning
+        sg.maybe_learn("clawra", "以後不要再遲到了", "好的我記住了")
+        growth_path = tmp_path / "clawra" / "SOUL_GROWTH.md"
+        assert growth_path.exists()
+        content = growth_path.read_text(encoding="utf-8")
+        assert "遲到" in content
+
+
+class TestCaringMessagePersonaAware:
+    """Tests for caring message using soul prompt instead of hardcoded JARVIS."""
+
+    @pytest.mark.asyncio
+    async def test_caring_message_uses_soul(self, mock_router):
+        """When soul is available, caring message uses soul.build_system_prompt."""
+        mock_soul = MagicMock()
+        mock_soul.build_system_prompt = MagicMock(return_value="你是 JARVIS")
+        mock_router.chat = AsyncMock(return_value=ChatResponse(content="Ted 注意休息", model="test"))
+        hb = Heartbeat(model_router=mock_router, soul=mock_soul)
+        result = await hb._compose_caring_message("tired", [])
+        assert result is not None
+        mock_soul.build_system_prompt.assert_called_with("jarvis")
+
+    @pytest.mark.asyncio
+    async def test_caring_message_fallback_without_soul(self, mock_router):
+        """Without soul, caring message still works (no system message)."""
+        mock_router.chat = AsyncMock(return_value=ChatResponse(content="注意休息", model="test"))
+        hb = Heartbeat(model_router=mock_router)
+        result = await hb._compose_caring_message("tired", [])
+        assert result is not None

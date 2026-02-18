@@ -8,11 +8,16 @@ Scheduled jobs:
 - backup:           daily 03:00 — encrypted MemOS + skills backup
 - memory_cleanup:   daily 03:15 — purge old fired reminders
 - night_owl:        cron check  — detect late-night activity, suggest rest
+- clawra_morning:   daily 08:30 — Clawra morning greeting
+- clawra_daily_share: daily ~15:00 — Clawra shares Seoul life / random thoughts
+- clawra_evening:   daily 22:00 — Clawra goodnight
+- clawra_missing_check: every 2h — Clawra "你在幹嘛" if silent too long
 """
 
 from __future__ import annotations
 
 import json
+import random
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,6 +25,13 @@ from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
+
+# ── Clawra proactive behavior constants ──────────────────────────
+_CLAWRA_MAX_DAILY = 3           # max proactive messages per day
+_CLAWRA_QUIET_START = 0         # no proactive messages 00:00-07:59
+_CLAWRA_QUIET_END = 8
+_CLAWRA_MIN_SILENCE_HOURS = 4   # hours without user msg before "missing" check
+_CLAWRA_COOLDOWN_SECS = 3600    # min gap between proactive messages (1 hr)
 
 
 class Heartbeat:
@@ -50,6 +62,8 @@ class Heartbeat:
         gog_worker: Any = None,
         reminder_manager: Any = None,
         fal_client: Any = None,
+        soul: Any = None,
+        voice_worker: Any = None,
     ):
         self.router = model_router
         self.memos = memos
@@ -62,9 +76,17 @@ class Heartbeat:
         self.gog = gog_worker
         self.reminder = reminder_manager
         self.fal_client = fal_client
+        self.soul = soul
+        self._voice_worker = voice_worker
 
+        self.ceo = None  # set externally for Agent SDK usage reporting
         self.scheduler = AsyncIOScheduler()
         self._running = False
+
+        # Clawra proactive behavior state
+        self._clawra_daily_count = 0
+        self._clawra_daily_date = ""  # "YYYY-MM-DD" for daily reset
+        self._clawra_last_sent = 0.0  # timestamp of last proactive msg
 
     def start(self) -> None:
         """Register all jobs and start the scheduler."""
@@ -137,11 +159,14 @@ class Heartbeat:
         )
 
         # Memory cleanup — after backup (Patch K1)
+        cleanup_minute = bm + 15
+        cleanup_hour = bh + cleanup_minute // 60
+        cleanup_minute = cleanup_minute % 60
         self.scheduler.add_job(
             self.memory_cleanup,
             "cron",
-            hour=bh,
-            minute=bm + 15 if bm + 15 < 60 else 0,
+            hour=cleanup_hour,
+            minute=cleanup_minute,
             id="memory_cleanup",
             name="Memory Cleanup",
         )
@@ -164,6 +189,47 @@ class Heartbeat:
                 minutes=5,
                 id="pending_selfies_check",
                 name="Pending Selfie Check",
+            )
+
+        # ── Clawra proactive behavior ────────────────────────────
+        if self.soul and self.telegram:
+            # Morning greeting (08:30)
+            self.scheduler.add_job(
+                self.clawra_morning,
+                "cron",
+                hour=8,
+                minute=30,
+                id="clawra_morning",
+                name="Clawra Morning Greeting",
+            )
+            # Daily share — Seoul life / random thoughts (random 13-17)
+            share_hour = random.randint(13, 17)
+            share_minute = random.randint(0, 59)
+            self.scheduler.add_job(
+                self.clawra_daily_share,
+                "cron",
+                hour=share_hour,
+                minute=share_minute,
+                id="clawra_daily_share",
+                name="Clawra Daily Share",
+            )
+            # Evening goodnight (22:00)
+            self.scheduler.add_job(
+                self.clawra_evening,
+                "cron",
+                hour=22,
+                minute=0,
+                id="clawra_evening",
+                name="Clawra Evening",
+            )
+            # Missing check — "你在幹嘛" if silent too long (every 2h, 08-22)
+            self.scheduler.add_job(
+                self.clawra_missing_check,
+                "cron",
+                hour="8-22/2",
+                minute=15,
+                id="clawra_missing_check",
+                name="Clawra Missing Check",
             )
 
         self.scheduler.start()
@@ -314,6 +380,16 @@ class Heartbeat:
                 parts.append(ceo._agent_executor.get_usage_line())
             except Exception:
                 pass
+
+        # Token pool balance status
+        try:
+            from core.model_balancer import get_status, check_alert
+            parts.append(f"\n📊 Token: {get_status()}")
+            alert = check_alert()
+            if alert:
+                parts.append(alert)
+        except Exception:
+            pass
 
         brief = "\n".join(parts)
 
@@ -582,6 +658,170 @@ class Heartbeat:
         logger.info(f"Memory cleanup: {result}")
         return result
 
+    # ── Clawra Proactive Behavior ────────────────────────────────
+
+    def _clawra_can_send(self) -> bool:
+        """Check if Clawra is allowed to send a proactive message now."""
+        now = datetime.now()
+        # Quiet hours: 00:00-07:59
+        if _CLAWRA_QUIET_START <= now.hour < _CLAWRA_QUIET_END:
+            return False
+        # Daily count reset
+        today = now.strftime("%Y-%m-%d")
+        if self._clawra_daily_date != today:
+            self._clawra_daily_date = today
+            self._clawra_daily_count = 0
+        # Over daily limit
+        if self._clawra_daily_count >= _CLAWRA_MAX_DAILY:
+            return False
+        # Cooldown
+        if time.time() - self._clawra_last_sent < _CLAWRA_COOLDOWN_SECS:
+            return False
+        return True
+
+    def _clawra_did_send(self) -> None:
+        """Record that a Clawra proactive message was sent."""
+        self._clawra_daily_count += 1
+        self._clawra_last_sent = time.time()
+
+    async def _send_clawra(self, text: str, *, voice_chance: float = 0.2) -> bool:
+        """Send a message from the Clawra bot.
+
+        Args:
+            text: Message text
+            voice_chance: Probability (0-1) of sending as voice message instead of text.
+                          Defaults to 20%.
+
+        Returns True on success.
+        """
+        if not self.telegram or not text:
+            return False
+        # Apply s2t conversion for consistency
+        try:
+            from opencc import OpenCC
+            cc = OpenCC("s2t")
+            text = cc.convert(text)
+        except ImportError:
+            pass
+        # P5: Random chance to send as voice message
+        if voice_chance > 0 and random.random() < voice_chance and self._voice_worker:
+            try:
+                audio_path = await self._voice_worker.text_to_speech(text, persona="clawra")
+                if audio_path:
+                    await self.telegram.send_voice(audio_path, persona="clawra")
+                    self._clawra_did_send()
+                    return True
+            except Exception as e:
+                logger.debug(f"Clawra voice fallback to text: {e}")
+        # Fallback: plain text
+        await self.telegram.send(text, persona="clawra")
+        self._clawra_did_send()
+        return True
+
+    async def _compose_clawra_message(self, scenario: str) -> str | None:
+        """Use LLM with SOUL_CLAWRA.md to generate a proactive message."""
+        if not self.router or not self.soul:
+            return None
+        try:
+            from clients.base_client import ChatMessage
+            from core.model_router import ModelRole
+
+            soul_prompt = self.soul.build_system_prompt("clawra")
+
+            prompt = (
+                f"你現在要主動傳訊息給 Ted。場景：{scenario}\n"
+                "要求：\n"
+                "- 用你的說話風格（口語、簡短、不用顏文字）\n"
+                "- 就像真的在 LINE/TG 傳訊息一樣\n"
+                "- 只回覆訊息內容本身，不要加任何說明\n"
+                "- 不超過 50 字\n"
+                "- 繁體中文"
+            )
+
+            response = await self.router.chat(
+                [
+                    ChatMessage(role="system", content=soul_prompt),
+                    ChatMessage(role="user", content=prompt),
+                ],
+                role=ModelRole.CEO,
+                task_type="cron_message",
+                max_tokens=100,
+            )
+            reply = response.content.strip().strip('"').strip("'")
+            # Clean leaked think tags
+            import re
+            reply = re.sub(r"</?think>", "", reply, flags=re.IGNORECASE)
+            reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL | re.IGNORECASE)
+            return reply if reply else None
+        except Exception as e:
+            logger.warning(f"Failed to compose Clawra message: {e}")
+            return None
+
+    async def clawra_morning(self) -> str | None:
+        """08:30 — Clawra morning greeting to Ted."""
+        if not self._clawra_can_send():
+            return None
+        msg = await self._compose_clawra_message(
+            "早上好，你剛起床準備傳早安訊息給男友。"
+            "首爾今天的天氣或你早上的狀況可以提一下。"
+        )
+        if msg:
+            await self._send_clawra(msg)
+            logger.info(f"Clawra morning greeting sent: {msg[:30]}")
+        return msg
+
+    async def clawra_daily_share(self) -> str | None:
+        """Random time 13-17 — Clawra shares Seoul daily life."""
+        if not self._clawra_can_send():
+            return None
+        scenarios = [
+            "你在首爾逛街看到有趣的東西，想跟男友分享",
+            "你剛吃完午餐，覺得很好吃想跟他說",
+            "你在咖啡廳坐著，突然想到他",
+            "首爾今天天氣不錯，你拍了路上的風景想傳給他",
+            "你看到一個很可愛的東西想跟他說",
+            "你在弘大那邊發現一家新開的店",
+        ]
+        msg = await self._compose_clawra_message(random.choice(scenarios))
+        if msg:
+            await self._send_clawra(msg)
+            logger.info(f"Clawra daily share sent: {msg[:30]}")
+        return msg
+
+    async def clawra_evening(self) -> str | None:
+        """22:00 — Clawra goodnight message."""
+        if not self._clawra_can_send():
+            return None
+        msg = await self._compose_clawra_message(
+            "晚上了，你準備要睡了。跟男友說晚安。"
+            "可以問他今天怎麼樣，或叫他早點睡。"
+        )
+        if msg:
+            await self._send_clawra(msg)
+            logger.info(f"Clawra evening sent: {msg[:30]}")
+        return msg
+
+    async def clawra_missing_check(self) -> str | None:
+        """Every 2h — if Ted hasn't messaged in 4+ hours, Clawra reaches out."""
+        if not self._clawra_can_send():
+            return None
+        if not self.memos:
+            return None
+        # Check last user activity
+        last_activity = await self.memos.working_memory.get("last_user_activity")
+        if not last_activity:
+            return None
+        silence_hours = (time.time() - last_activity) / 3600
+        if silence_hours < _CLAWRA_MIN_SILENCE_HOURS:
+            return None
+        msg = await self._compose_clawra_message(
+            f"男友已經 {int(silence_hours)} 小時沒有找你了，你想知道他在幹嘛。"
+        )
+        if msg:
+            await self._send_clawra(msg)
+            logger.info(f"Clawra missing check sent (silent {silence_hours:.1f}h): {msg[:30]}")
+        return msg
+
     # ── Helpers ──────────────────────────────────────────────────
 
     def _should_reach_out(
@@ -617,16 +857,22 @@ class Heartbeat:
             if events:
                 prompt_parts.append(f"即將到來的行程: {events}")
 
+            # Use JARVIS soul prompt if available, else fallback
+            messages = []
+            if self.soul:
+                soul_prompt = self.soul.build_system_prompt("jarvis")
+                messages.append(ChatMessage(role="system", content=soul_prompt))
+
             prompt = (
-                "你是 J.A.R.V.I.S.，Tony Stark 的 AI 管家。"
                 "請根據以下資訊，用簡短溫暖的中文（繁體）寫一段關懷訊息（不超過 100 字）。\n"
                 + "\n".join(prompt_parts)
             )
+            messages.append(ChatMessage(role="user", content=prompt))
 
             response = await self.router.chat(
-                [ChatMessage(role="user", content=prompt)],
+                messages,
                 role=ModelRole.CEO,
-                task_type="template",
+                task_type="cron_message",
                 max_tokens=200,
             )
             return response.content

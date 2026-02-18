@@ -23,70 +23,78 @@ import pytest
 # ── Environment prep tests ─────────────────────────────────────
 
 
-class TestPrepareEnv:
-    """Test _prepare_env() function."""
+class TestAgentEnv:
+    """Test _agent_env() context manager."""
 
     def test_clears_claudecode_markers(self):
-        from core.agent_executor import _prepare_env
+        from core.agent_executor import _agent_env
 
         os.environ["CLAUDECODE"] = "1"
         os.environ["CLAUDE_CODE_ENTRY_POINT"] = "test"
         os.environ["CLAUDE_CODE_SESSION_ID"] = "abc"
-        _prepare_env()
-        assert "CLAUDECODE" not in os.environ
-        assert "CLAUDE_CODE_ENTRY_POINT" not in os.environ
-        assert "CLAUDE_CODE_SESSION_ID" not in os.environ
+        with _agent_env():
+            assert "CLAUDECODE" not in os.environ
+            assert "CLAUDE_CODE_ENTRY_POINT" not in os.environ
+            assert "CLAUDE_CODE_SESSION_ID" not in os.environ
+        # Restored after exit
+        assert os.environ.get("CLAUDECODE") == "1"
+        # Cleanup
+        os.environ.pop("CLAUDECODE", None)
+        os.environ.pop("CLAUDE_CODE_ENTRY_POINT", None)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
 
     def test_maps_zhipu_to_anthropic_key(self):
-        from core.agent_executor import _prepare_env
+        from core.agent_executor import _agent_env
 
         os.environ.pop("ANTHROPIC_API_KEY", None)
         os.environ["ZHIPU_API_KEY"] = "test-zhipu-key"
-        _prepare_env()
-        assert os.environ.get("ANTHROPIC_API_KEY") == "test-zhipu-key"
-        # Cleanup
-        os.environ.pop("ANTHROPIC_API_KEY", None)
+        with _agent_env():
+            assert os.environ.get("ANTHROPIC_API_KEY") == "test-zhipu-key"
+        # Restored after exit
+        assert os.environ.get("ANTHROPIC_API_KEY") is None
 
-    def test_does_not_overwrite_existing_anthropic_key(self):
-        from core.agent_executor import _prepare_env
+    def test_restores_existing_anthropic_key(self):
+        from core.agent_executor import _agent_env
 
         os.environ["ANTHROPIC_API_KEY"] = "existing-key"
-        os.environ["ZHIPU_API_KEY"] = "should-not-replace"
-        _prepare_env()
+        os.environ["ZHIPU_API_KEY"] = "zhipu-key"
+        with _agent_env():
+            assert os.environ["ANTHROPIC_API_KEY"] == "zhipu-key"
+        # Restored to original value
         assert os.environ["ANTHROPIC_API_KEY"] == "existing-key"
         os.environ.pop("ANTHROPIC_API_KEY", None)
 
     def test_sets_base_url(self):
-        from core.agent_executor import _prepare_env
+        from core.agent_executor import _agent_env
 
         os.environ.pop("ANTHROPIC_BASE_URL", None)
-        _prepare_env()
-        assert "open.bigmodel.cn" in os.environ.get("ANTHROPIC_BASE_URL", "")
+        with _agent_env():
+            assert "open.bigmodel.cn" in os.environ.get("ANTHROPIC_BASE_URL", "")
+        # Cleaned up after exit
+        assert os.environ.get("ANTHROPIC_BASE_URL") is None
 
     def test_sets_model_tier_env_vars(self):
-        from core.agent_executor import _prepare_env
+        from core.agent_executor import _agent_env
 
         os.environ.pop("ANTHROPIC_DEFAULT_SONNET_MODEL", None)
         os.environ.pop("ANTHROPIC_DEFAULT_HAIKU_MODEL", None)
-        _prepare_env()
-        assert os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL") is not None
-        assert os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") is not None
+        with _agent_env():
+            assert os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL") is not None
+            assert os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") is not None
 
     def test_model_tier_uses_zhipu_env(self):
-        from core.agent_executor import _prepare_env
+        from core.agent_executor import _agent_env
 
         os.environ.pop("ANTHROPIC_DEFAULT_SONNET_MODEL", None)
         os.environ.pop("ANTHROPIC_DEFAULT_HAIKU_MODEL", None)
         os.environ["ZHIPU_CEO_MODEL"] = "my-ceo-model"
         os.environ["ZHIPU_LITE_MODEL"] = "my-lite-model"
-        _prepare_env()
-        assert os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL") == "my-ceo-model"
-        assert os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") == "my-lite-model"
+        with _agent_env():
+            assert os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL") == "my-ceo-model"
+            assert os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") == "my-lite-model"
         # Cleanup
         os.environ.pop("ZHIPU_CEO_MODEL", None)
         os.environ.pop("ZHIPU_LITE_MODEL", None)
-        os.environ.pop("ANTHROPIC_DEFAULT_SONNET_MODEL", None)
-        os.environ.pop("ANTHROPIC_DEFAULT_HAIKU_MODEL", None)
 
 
 # ── Tier config tests ──────────────────────────────────────────
