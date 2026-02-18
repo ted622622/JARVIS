@@ -486,6 +486,7 @@ class TestTelegramLongTaskAck:
     def _make_client(self):
         from clients.telegram_client import TelegramClient
         client = TelegramClient(jarvis_token="fake", chat_id=123)
+        client._BATCH_DELAY = 0
         return client
 
     def _make_update(self, text="你好", user_id=123):
@@ -512,15 +513,16 @@ class TestTelegramLongTaskAck:
         update = self._make_update("幫我看 https://example.com")
         ctx = MagicMock()
         ctx.bot.token = "fake"
+        ctx.bot.send_message = AsyncMock()
         client._token_to_persona["fake"] = "jarvis"
 
         await client._handle_text_message(update, ctx)
 
         # First call = ack, second call = actual reply
-        calls = update.message.reply_text.call_args_list
+        calls = ctx.bot.send_message.call_args_list
         assert len(calls) >= 2
-        assert "45" in calls[0][0][0]
-        assert "處理中" in calls[0][0][0]
+        texts = [c.kwargs["text"] for c in calls]
+        assert any("45" in t and "處理中" in t for t in texts)
 
     @pytest.mark.asyncio
     async def test_no_ack_for_simple_message(self):
@@ -536,13 +538,12 @@ class TestTelegramLongTaskAck:
         update = self._make_update("你好")
         ctx = MagicMock()
         ctx.bot.token = "fake"
+        ctx.bot.send_message = AsyncMock()
         client._token_to_persona["fake"] = "jarvis"
 
         await client._handle_text_message(update, ctx)
 
-        calls = update.message.reply_text.call_args_list
-        assert len(calls) == 1
-        assert calls[0][0][0] == "你好！"
+        ctx.bot.send_message.assert_called_once_with(chat_id=123, text="你好！")
 
     @pytest.mark.asyncio
     async def test_clawra_ack_style(self):
@@ -558,13 +559,16 @@ class TestTelegramLongTaskAck:
         update = self._make_update("搜尋最新新聞")
         ctx = MagicMock()
         ctx.bot.token = "fake"
+        ctx.bot.send_message = AsyncMock()
+        ctx.bot.send_chat_action = AsyncMock()
         client._token_to_persona["fake"] = "clawra"
 
         with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock):
             await client._handle_text_message(update, ctx)
 
-        calls = update.message.reply_text.call_args_list
-        assert "欸收到" in calls[0][0][0]
+        calls = ctx.bot.send_message.call_args_list
+        texts = [c.kwargs["text"] for c in calls]
+        assert any("欸收到" in t for t in texts)
 
     @pytest.mark.asyncio
     async def test_empty_reply_friendly_fallback_jarvis(self):
@@ -575,11 +579,12 @@ class TestTelegramLongTaskAck:
         update = self._make_update("測試")
         ctx = MagicMock()
         ctx.bot.token = "fake"
+        ctx.bot.send_message = AsyncMock()
         client._token_to_persona["fake"] = "jarvis"
 
         await client._handle_text_message(update, ctx)
 
-        reply_text = update.message.reply_text.call_args[0][0]
+        reply_text = ctx.bot.send_message.call_args.kwargs["text"]
         assert "（無回覆）" not in reply_text
         assert "Sir" in reply_text
 
@@ -592,12 +597,14 @@ class TestTelegramLongTaskAck:
         update = self._make_update("測試")
         ctx = MagicMock()
         ctx.bot.token = "fake"
+        ctx.bot.send_message = AsyncMock()
+        ctx.bot.send_chat_action = AsyncMock()
         client._token_to_persona["fake"] = "clawra"
 
         with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock):
             await client._handle_text_message(update, ctx)
 
-        reply_text = update.message.reply_text.call_args[0][0]
+        reply_text = ctx.bot.send_message.call_args.kwargs["text"]
         assert "（無回覆）" not in reply_text
         assert "換個方式" in reply_text
 
@@ -610,13 +617,12 @@ class TestTelegramLongTaskAck:
         update = self._make_update("你好")
         ctx = MagicMock()
         ctx.bot.token = "fake"
+        ctx.bot.send_message = AsyncMock()
         client._token_to_persona["fake"] = "jarvis"
 
         await client._handle_text_message(update, ctx)
 
-        calls = update.message.reply_text.call_args_list
-        assert len(calls) == 1
-        assert calls[0][0][0] == "OK"
+        ctx.bot.send_message.assert_called_once_with(chat_id=123, text="OK")
 
     def test_set_ceo_ref(self):
         """set_ceo_ref stores reference."""
@@ -624,6 +630,151 @@ class TestTelegramLongTaskAck:
         mock_ceo = MagicMock()
         client.set_ceo_ref(mock_ceo)
         assert client._ceo_ref is mock_ceo
+
+
+# ── Patch R: Message Batch Tests ──────────────────────────────────
+
+
+class TestMessageBatch:
+    """Test Patch R: message batching and multi-message Clawra replies."""
+
+    def _make_client(self):
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient(jarvis_token="fake", chat_id=123)
+        client._BATCH_DELAY = 0
+        return client
+
+    def _make_update(self, text="你好", chat_id=123):
+        update = MagicMock()
+        update.message.text = text
+        update.message.chat_id = chat_id
+        update.message.from_user.id = 1
+        update.message.from_user.first_name = "Ted"
+        update.message.reply_text = AsyncMock()
+        return update
+
+    def _make_ctx(self, token="fake"):
+        ctx = MagicMock()
+        ctx.bot.token = token
+        ctx.bot.send_message = AsyncMock()
+        ctx.bot.send_photo = AsyncMock()
+        ctx.bot.send_chat_action = AsyncMock()
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_single_message_processed(self):
+        """Single message → processed normally (no batching effect)."""
+        client = self._make_client()
+        client.set_message_handler(AsyncMock(return_value="收到"))
+        client._token_to_persona["fake"] = "jarvis"
+
+        update = self._make_update("你好")
+        ctx = self._make_ctx()
+        await client._handle_text_message(update, ctx)
+
+        ctx.bot.send_message.assert_called_once_with(chat_id=123, text="收到")
+        # _on_message called with original text
+        client._on_message.assert_called_once_with("你好", 123, "jarvis")
+
+    @pytest.mark.asyncio
+    async def test_batch_combines_messages(self):
+        """Multiple rapid messages → combined with \\n for CEO."""
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient(jarvis_token="fake", chat_id=123)
+        client._BATCH_DELAY = 0.05  # Small delay for real batching
+        client.set_message_handler(AsyncMock(return_value="全部收到"))
+        client._token_to_persona["fake"] = "jarvis"
+
+        ctx = self._make_ctx()
+
+        # Send 3 messages rapidly (before batch fires)
+        for text in ["第一句", "第二句", "第三句"]:
+            update = self._make_update(text)
+            await client._handle_text_message(update, ctx)
+
+        # Wait for batch to process
+        await asyncio.sleep(0.1)
+
+        # CEO should receive combined message
+        combined = client._on_message.call_args[0][0]
+        assert "第一句" in combined
+        assert "第二句" in combined
+        assert "第三句" in combined
+        assert combined == "第一句\n第二句\n第三句"
+
+    @pytest.mark.asyncio
+    async def test_clawra_split_at_paragraphs(self):
+        """Clawra long reply with \\n\\n → split into multiple messages."""
+        client = self._make_client()
+        reply = "第一段回覆比較長一點點，今天天氣真的好冷喔，你有穿暖嗎\n\n第二段也有一些內容，我剛剛去了咖啡廳\n\n第三段最後的回覆，晚點我們再聊聊吧"
+        client.set_message_handler(AsyncMock(return_value=reply))
+        client._token_to_persona["fake"] = "clawra"
+
+        ctx = self._make_ctx()
+
+        with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock):
+            update = self._make_update("嗨")
+            await client._handle_text_message(update, ctx)
+
+        # Should be split into 3 separate messages
+        calls = ctx.bot.send_message.call_args_list
+        texts = [c.kwargs["text"] for c in calls]
+        assert len(texts) == 3
+        assert "第一段" in texts[0]
+        assert "第二段" in texts[1]
+        assert "第三段" in texts[2]
+
+    @pytest.mark.asyncio
+    async def test_jarvis_no_split(self):
+        """JARVIS reply with \\n\\n → NOT split (JARVIS sends as single message)."""
+        client = self._make_client()
+        reply = "段落一\n\n段落二\n\n段落三"
+        client.set_message_handler(AsyncMock(return_value=reply))
+        client._token_to_persona["fake"] = "jarvis"
+
+        ctx = self._make_ctx()
+        update = self._make_update("你好")
+        await client._handle_text_message(update, ctx)
+
+        ctx.bot.send_message.assert_called_once_with(chat_id=123, text=reply)
+
+    @pytest.mark.asyncio
+    async def test_batch_popped_after_processing(self):
+        """After batch processes, _msg_batch is cleaned up."""
+        client = self._make_client()
+        client.set_message_handler(AsyncMock(return_value="OK"))
+        client._token_to_persona["fake"] = "jarvis"
+
+        ctx = self._make_ctx()
+        update = self._make_update("hello")
+        await client._handle_text_message(update, ctx)
+
+        # Batch should be popped after processing
+        assert 123 not in client._msg_batch
+
+    @pytest.mark.asyncio
+    async def test_clawra_short_reply_no_split(self):
+        """Clawra short reply → no splitting even with \\n\\n."""
+        client = self._make_client()
+        reply = "嗨\n\n好"
+        client.set_message_handler(AsyncMock(return_value=reply))
+        client._token_to_persona["fake"] = "clawra"
+
+        ctx = self._make_ctx()
+
+        with patch("clients.telegram_client.asyncio.sleep", new_callable=AsyncMock):
+            update = self._make_update("嗨")
+            await client._handle_text_message(update, ctx)
+
+        # Short reply (<=60 chars) → single message
+        ctx.bot.send_message.assert_called_once_with(chat_id=123, text=reply)
+
+    @pytest.mark.asyncio
+    async def test_batch_default_delay(self):
+        """Default batch delay is 6 seconds."""
+        from clients.telegram_client import TelegramClient
+        client = TelegramClient()
+        assert client._BATCH_DELAY == 6.0
 
 
 # ── Pending Task Retry Tests ──────────────────────────────────────

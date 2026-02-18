@@ -33,6 +33,31 @@ from core.shared_memory import SharedMemory
 from core.soul_growth import SoulGrowth
 from core.task_router import TaskRouter
 
+# ── Phase 2: Agent SDK complexity classification ─────────────────
+
+
+class TaskComplexity:
+    SIMPLE = "simple"
+    MEDIUM = "medium"
+    COMPLEX = "complex"
+
+
+_COMPLEX_PATTERNS = re.compile(
+    r"幫我訂|幫我預約|幫我安排|"
+    r"幫我研究|幫我分析|幫我比較|"
+    r"幫我寫一[份篇封]|幫我整理|"
+    r"做一個.*計畫|規劃.*行程|"
+    r"查.*然後.*整理|搜.*然後.*比較|"
+    r"步驟|流程|完整",
+    re.IGNORECASE,
+)
+
+_SIMPLE_PATTERNS = re.compile(
+    r"^(你好|嗨|hi|hello|早安|晚安|在嗎|幹嘛|"
+    r"謝謝|好的|OK|嗯|哈哈|欸|喔|對|是)",
+    re.IGNORECASE,
+)
+
 # Pattern for LLM tool calls in response text (fallback)
 _TOOL_PATTERN = re.compile(r'\[(?:FETCH|SEARCH|MAPS):([^\]]+)\]')
 
@@ -182,6 +207,8 @@ class CEOAgent:
         # Patch J: soul evolution
         self._soul_growth: SoulGrowth | None = None
         self._shared_memory: SharedMemory | None = None
+        # Phase 2: Agent SDK executor (lazy-init)
+        self._agent_executor: Any = None
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -234,6 +261,33 @@ class CEOAgent:
             if active_persona == "clawra":
                 return "欸...我有點累了，讓我休息一下下好嗎？大概 15 分鐘後回來找你 💤"
             return "Sir, 系統需要短暫休息。預計 15 分鐘後恢復，屆時我會主動通知您。"
+
+    # ── Phase 2: Agent SDK helpers ──────────────────────────────
+
+    def _classify_complexity(self, message: str) -> str:
+        """Classify message complexity for Agent SDK routing."""
+        if len(message) < 10:
+            return TaskComplexity.SIMPLE
+        if _SIMPLE_PATTERNS.match(message):
+            return TaskComplexity.SIMPLE
+        if _COMPLEX_PATTERNS.search(message):
+            return TaskComplexity.COMPLEX
+        if _WEB_NEED_PATTERNS.search(message):
+            return TaskComplexity.MEDIUM
+        return TaskComplexity.SIMPLE
+
+    def _get_agent_executor(self) -> Any:
+        """Lazy-init AgentExecutor."""
+        if self._agent_executor is None:
+            try:
+                from core.agent_executor import AgentExecutor
+                self._agent_executor = AgentExecutor(
+                    jarvis_root=str(Path(__file__).parent.parent)
+                )
+            except ImportError:
+                logger.warning("claude-agent-sdk not installed, Agent SDK disabled")
+                return None
+        return self._agent_executor
 
     async def _process_message(
         self,
@@ -288,6 +342,56 @@ class CEOAgent:
                     extra_ctx["相關記憶"] = mem_ctx
             except Exception as e:
                 logger.debug(f"Memory search failed: {e}")
+
+        # 2.5 Phase 2: Agent SDK dispatch for COMPLEX tasks
+        complexity = self._classify_complexity(user_message)
+        if complexity == TaskComplexity.COMPLEX:
+            executor = self._get_agent_executor()
+            if executor is not None:
+                logger.info("Task COMPLEX → Agent SDK dispatch")
+                mem_ctx = extra_ctx.get("相關記憶", "")
+                try:
+                    sdk_result = await executor.run(
+                        task=user_message,
+                        tier="complex",
+                        persona=active_persona,
+                        extra_context=mem_ctx,
+                    )
+                    if sdk_result["success"]:
+                        reply = sdk_result["response"]
+                        await self._store_conversation(
+                            user_message, reply, session_id,
+                        )
+                        self._compressor.add_turn("assistant", reply)
+                        logger.info(
+                            f"Agent SDK success: {sdk_result['tool_calls']} tools, "
+                            f"{sdk_result['duration']}s"
+                        )
+                        # 80% quota warning
+                        if executor.is_quota_low():
+                            usage = executor.get_daily_usage()
+                            logger.warning(
+                                f"Agent SDK quota alert: "
+                                f"{usage['usage_pct']}% used "
+                                f"({usage['daily_tokens']:,}/{usage['daily_limit']:,})"
+                            )
+                            # Append warning to reply so TG user sees it
+                            reply += (
+                                f"\n\n⚠️ Agent SDK 額度: "
+                                f"{usage['usage_pct']}% 已使用"
+                            )
+                        # Extract phone/url for TG separate messages
+                        phone = self._extract_phone(reply)
+                        booking_url = self._extract_booking_url(reply)
+                        if phone or booking_url:
+                            return {
+                                "text": reply,
+                                "phone": phone,
+                                "booking_url": booking_url,
+                            }
+                        return reply
+                except Exception as e:
+                    logger.warning(f"Agent SDK failed: {e}, falling back")
 
         # 2d. Proactive web search — detect need and fetch BEFORE LLM responds
         web_results = await self._proactive_web_search(user_message)
@@ -654,6 +758,30 @@ class CEOAgent:
             return {"is_long": True, "reason": "complex_instruction", "estimate_seconds": 30}
         return {"is_long": False, "reason": "", "estimate_seconds": 5}
 
+    # ── Phase 2: Reply extraction helpers ────────────────────────
+
+    @staticmethod
+    def _extract_phone(text: str) -> str | None:
+        """Extract phone number from reply text."""
+        m = re.search(
+            r'(\+?\d{1,4}[-\s]?\(?\d{1,4}\)?[-\s]?\d{2,4}[-\s]?\d{2,4}[-\s]?\d{0,4})',
+            text,
+        )
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _extract_booking_url(text: str) -> str | None:
+        """Extract booking-related URL from reply text."""
+        m = re.search(
+            r'(https?://(?:inline\.app|www\.opentable|eztable|'
+            r'booking|reserve)[^\s\)]+)',
+            text, re.IGNORECASE,
+        )
+        if m:
+            return m.group(1)
+        m = re.search(r'(https?://[^\s\)]+)', text)
+        return m.group(1) if m else None
+
     @property
     def react_executor(self) -> ReactExecutor | None:
         if self._react is None and self.workers:
@@ -661,6 +789,12 @@ class CEOAgent:
         return self._react
 
     # ── Skill Invocation (Task 8.3) ─────────────────────────────
+
+    # Regex pre-check: force skill invocation without LLM judge
+    _SELFIE_FORCE_PATTERN = re.compile(
+        r"自拍|照片|穿搭|selfie|拍.*?照|看看妳|看我|傳.*?照",
+        re.IGNORECASE,
+    )
 
     async def _try_skill_match(
         self, user_message: str, persona: str = "jarvis", session_id: str = "default",
@@ -675,35 +809,63 @@ class CEOAgent:
         if not self.skills:
             return None
 
-        # Ask CEO model to determine if a skill should be invoked
         skill_list = self.skills.list_all()
         if not skill_list:
             return None
 
-        skill_info = ", ".join(
-            f"{s.name}({s.description[:40]})" for s in skill_list
-        )
+        # ── Regex pre-check: bypass LLM judge for known skill keywords ──
+        skill_name: str | None = None
+        if self._SELFIE_FORCE_PATTERN.search(user_message) and self.skills.get("selfie"):
+            skill_name = "selfie"
+            logger.info(f"Skill pre-match (regex): {skill_name}")
 
-        judge_prompt = (
-            f"可用技能: [{skill_info}]\n"
-            f"用戶訊息: {user_message}\n\n"
-            "如果這個訊息明確需要調用某個技能，回覆「SKILL:技能名稱」。\n"
-            "如果不需要調用技能，回覆「NONE」。\n"
-            "只回覆 SKILL:xxx 或 NONE，不要有其他文字。"
-        )
+        # ── LLM judge fallback for non-regex matches ──
+        if not skill_name:
+            skill_info = ", ".join(
+                f"{s.name}({s.description[:40]})" for s in skill_list
+            )
+
+            # Inject recent conversation history for context-aware matching
+            history_hint = ""
+            if self.memos:
+                try:
+                    sid = f"{persona}_{self._session_id}"
+                    history = await self.memos.get_conversation(session_id=sid, limit=4)
+                    if history:
+                        lines = []
+                        for entry in history[-4:]:
+                            role = "用戶" if entry.get("role") == "user" else "助理"
+                            lines.append(f"{role}: {entry.get('content', '')[:60]}")
+                        history_hint = "最近對話:\n" + "\n".join(lines) + "\n\n"
+                except Exception:
+                    pass
+
+            judge_prompt = (
+                f"可用技能: [{skill_info}]\n"
+                f"{history_hint}"
+                f"用戶訊息: {user_message}\n\n"
+                "根據上下文判斷，這個訊息是否需要調用某個技能？\n"
+                "例如：如果之前在討論拍照/自拍，用戶說「再來一次」，就應該調用 selfie。\n"
+                "回覆「SKILL:技能名稱」或「NONE」，不要有其他文字。"
+            )
+
+            try:
+                response = await self.router.chat(
+                    [ChatMessage(role="user", content=judge_prompt)],
+                    role=ModelRole.CEO,
+                    task_type="template",
+                    max_tokens=30,
+                    temperature=0.1,
+                )
+                answer = response.content.strip()
+
+                if answer.startswith("SKILL:"):
+                    skill_name = answer[6:].strip()
+            except Exception as e:
+                logger.debug(f"Skill LLM judge failed: {e}")
 
         try:
-            response = await self.router.chat(
-                [ChatMessage(role="user", content=judge_prompt)],
-                role=ModelRole.CEO,
-                task_type="template",
-                max_tokens=30,
-                temperature=0.1,
-            )
-            answer = response.content.strip()
-
-            if answer.startswith("SKILL:"):
-                skill_name = answer[6:].strip()
+            if skill_name:
                 meta = self.skills.get(skill_name)
                 if meta:
                     logger.info(f"CEO invoking skill: {skill_name}")

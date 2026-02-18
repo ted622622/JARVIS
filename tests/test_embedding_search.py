@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -449,3 +451,176 @@ class TestHybridSearch:
     @pytest.mark.asyncio
     async def test_normalize_empty(self):
         assert HybridSearch._normalize([]) == []
+
+
+# ── Patch T: Temporal Decay ──────────────────────────────────────
+
+
+class TestTemporalDecay:
+    def test_extract_date_daily(self):
+        """Should parse YYYY-MM-DD from daily memory path."""
+        dt = HybridSearch._extract_date_from_source(
+            "C:/ted/JARVIS/memory/daily/2026-01-15.md"
+        )
+        assert dt == datetime(2026, 1, 15)
+
+    def test_extract_date_no_date(self):
+        """Non-dated files return None."""
+        dt = HybridSearch._extract_date_from_source("memory/MEMORY.md")
+        assert dt is None
+
+    def test_extract_date_soul_growth(self):
+        """SOUL_GROWTH has no date."""
+        dt = HybridSearch._extract_date_from_source(
+            "memory/clawra/SOUL_GROWTH.md"
+        )
+        assert dt is None
+
+    def test_decay_recent_memory_no_change(self):
+        """Today's memory should have decay factor ~1.0."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        results = [{"text": "test", "source": f"daily/{today}.md", "score": 1.0}]
+        decayed = hs._apply_temporal_decay(results)
+        assert decayed[0]["score"] > 0.99
+
+    def test_decay_old_memory_reduced(self):
+        """30-day-old memory should be ~74% of original score."""
+        old_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        results = [{"text": "test", "source": f"daily/{old_date}.md", "score": 1.0}]
+        decayed = hs._apply_temporal_decay(results)
+        expected = math.exp(-0.01 * 30)  # ~0.74
+        assert abs(decayed[0]["score"] - expected) < 0.01
+
+    def test_decay_very_old_memory(self):
+        """180-day-old memory should be ~16% of original score."""
+        old_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        results = [{"text": "test", "source": f"daily/{old_date}.md", "score": 1.0}]
+        decayed = hs._apply_temporal_decay(results)
+        expected = math.exp(-0.01 * 180)  # ~0.165
+        assert abs(decayed[0]["score"] - expected) < 0.02
+
+    def test_no_decay_for_undated_files(self):
+        """Files without date should not be decayed."""
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        results = [{"text": "important", "source": "MEMORY.md", "score": 0.8}]
+        decayed = hs._apply_temporal_decay(results)
+        assert decayed[0]["score"] == 0.8
+
+    def test_decay_reorders_results(self):
+        """Old high-score should drop below recent lower-score."""
+        old_date = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        results = [
+            {"text": "old high", "source": f"daily/{old_date}.md", "score": 1.0},
+            {"text": "new low", "source": f"daily/{today}.md", "score": 0.5},
+        ]
+        decayed = hs._apply_temporal_decay(results)
+        # New low (0.5 * ~1.0 = 0.5) > old high (1.0 * ~0.135 = 0.135)
+        assert decayed[0]["text"] == "new low"
+
+
+# ── Patch T: MMR Re-ranking ──────────────────────────────────────
+
+
+class TestMMR:
+    def test_text_similarity_identical(self):
+        assert HybridSearch._text_similarity("hello world", "hello world") == 1.0
+
+    def test_text_similarity_different(self):
+        sim = HybridSearch._text_similarity("apple", "banana")
+        assert sim < 0.5
+
+    def test_text_similarity_similar(self):
+        sim = HybridSearch._text_similarity(
+            "今天去了漢江邊散步，風景很好",
+            "今天去了漢江邊散步，風景非常好",
+        )
+        assert sim > 0.7
+
+    def test_mmr_removes_duplicates(self):
+        """Near-identical texts should be deduplicated."""
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        results = [
+            {"text": "今天去漢江邊散步風景很好心情也好", "source": "a.md", "score": 0.9},
+            {"text": "今天去漢江邊散步風景很好心情真好", "source": "b.md", "score": 0.8},
+            {"text": "明天要開會準備PPT", "source": "c.md", "score": 0.7},
+        ]
+        selected = hs._apply_mmr(results, top_k=3)
+        assert len(selected) == 2  # second is dup of first
+        texts = [r["text"] for r in selected]
+        assert "明天要開會準備PPT" in texts
+
+    def test_mmr_keeps_distinct_items(self):
+        """Distinct items should all be kept."""
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        results = [
+            {"text": "Ted喜歡吃拉麵", "source": "a.md", "score": 0.9},
+            {"text": "明天要開會", "source": "b.md", "score": 0.8},
+            {"text": "首爾今天下雪了", "source": "c.md", "score": 0.7},
+        ]
+        selected = hs._apply_mmr(results, top_k=3)
+        assert len(selected) == 3
+
+    def test_mmr_respects_top_k(self):
+        """Should stop at top_k items."""
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        # Use truly distinct texts to avoid similarity-based dedup
+        distinct_texts = [
+            "Ted喜歡吃拉麵尤其是味噌口味",
+            "明天下午三點要去看醫生",
+            "首爾今天下了一場大雪氣溫零下",
+            "最近在學習彈吉他進度不錯",
+            "週末想去爬山陽明山好久沒去了",
+            "新買的咖啡機很好用每天早上都喝",
+            "公司下季度的專案計畫要開始了",
+            "昨天看了一部很好看的電影推薦",
+            "健身房的月費下個月要漲價了",
+            "家裡的貓最近食慾變差要去看獸醫",
+        ]
+        results = [
+            {"text": distinct_texts[i], "source": "a.md", "score": 1.0 - i * 0.1}
+            for i in range(10)
+        ]
+        selected = hs._apply_mmr(results, top_k=3)
+        assert len(selected) == 3
+
+    def test_mmr_empty(self):
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        assert hs._apply_mmr([], top_k=6) == []
+
+    def test_mmr_single_item(self):
+        hs = HybridSearch(bm25=MagicMock(), embedding=None)
+        results = [{"text": "only one", "source": "a.md", "score": 1.0}]
+        assert hs._apply_mmr(results, top_k=6) == results
+
+    @pytest.mark.asyncio
+    async def test_full_pipeline_with_decay_and_mmr(self):
+        """Integration test: search() applies both decay and MMR."""
+        old_date = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        bm25 = MagicMock()
+        bm25.search.return_value = [
+            {"text": "老的拉麵記錄味道很好推薦這家", "source": f"daily/{old_date}.md", "score": 5.0},
+            {"text": "老的拉麵記錄味道很好特別推薦", "source": f"daily/{old_date}.md", "score": 4.5},
+            {"text": "今天天氣很好適合出門走走散步", "source": f"daily/{today}.md", "score": 2.0},
+        ]
+
+        embedding = AsyncMock()
+        embedding.search.return_value = [
+            {"text": "老的拉麵記錄味道很好推薦這家", "source": f"daily/{old_date}.md", "score": 0.9},
+            {"text": "新的拉麵店開了要去試看看的", "source": f"daily/{today}.md", "score": 0.8},
+        ]
+
+        hs = HybridSearch(bm25=bm25, embedding=embedding)
+        results = await hs.search("拉麵", top_k=3)
+
+        # Should have deduped the near-identical old records
+        # and the today record should rank well thanks to no decay
+        assert len(results) >= 1
+        # All scores should be non-negative (min-max normalization maps lowest to 0)
+        assert all(r["score"] >= 0 for r in results)

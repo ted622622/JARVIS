@@ -125,9 +125,11 @@ class TestLongContentTrigger:
             mock_hlc.return_value = "chunked_reply"
             with patch.object(ceo_with_deps, "_try_skill_match", new_callable=AsyncMock) as mock_skill:
                 mock_skill.return_value = None
-                result = await ceo_with_deps._process_message(
-                    long_msg, "jarvis", "jarvis_default", None, False
-                )
+                # Skip Agent SDK dispatch so long content handler is reached
+                with patch.object(ceo_with_deps, "_get_agent_executor", return_value=None):
+                    result = await ceo_with_deps._process_message(
+                        long_msg, "jarvis", "jarvis_default", None, False
+                    )
         mock_hlc.assert_called_once()
         assert result == "chunked_reply"
 

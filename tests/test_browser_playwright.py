@@ -487,32 +487,31 @@ class TestTelegramPhoneFallback:
         from clients.telegram_client import TelegramClient
 
         client = TelegramClient()
+        client._BATCH_DELAY = 0
         client._on_message = AsyncMock(return_value={
             "text": "找到了滿築火鍋！",
             "phone": "02-1234-5678",
         })
-        client.send = AsyncMock()
         client._token_to_persona = {"token123": "jarvis"}
 
-        # Mock update
         update = MagicMock()
         update.message.text = "幫我訂滿築"
         update.message.chat_id = 123
         update.message.from_user.id = 1
         update.message.from_user.first_name = "Ted"
-        update.message.reply_text = AsyncMock()
-        update.message.reply_photo = AsyncMock()
 
         ctx = MagicMock()
         ctx.bot.token = "token123"
+        ctx.bot.send_message = AsyncMock()
 
         client._allowed_user_ids = set()
         await client._handle_text_message(update, ctx)
 
-        # Text reply
-        update.message.reply_text.assert_called_once_with("找到了滿築火鍋！")
-        # Phone sent separately
-        client.send.assert_called_once_with("02-1234-5678", persona="jarvis", chat_id=123)
+        # Text + phone both sent via bot.send_message
+        calls = [c.kwargs for c in ctx.bot.send_message.call_args_list]
+        texts = [c["text"] for c in calls]
+        assert "找到了滿築火鍋！" in texts
+        assert "02-1234-5678" in texts
 
     @pytest.mark.asyncio
     async def test_dict_reply_without_phone_no_extra(self):
@@ -520,10 +519,10 @@ class TestTelegramPhoneFallback:
         from clients.telegram_client import TelegramClient
 
         client = TelegramClient()
+        client._BATCH_DELAY = 0
         client._on_message = AsyncMock(return_value={
             "text": "一般回覆",
         })
-        client.send = AsyncMock()
         client._token_to_persona = {"tok": "jarvis"}
 
         update = MagicMock()
@@ -531,16 +530,15 @@ class TestTelegramPhoneFallback:
         update.message.chat_id = 123
         update.message.from_user.id = 1
         update.message.from_user.first_name = "Ted"
-        update.message.reply_text = AsyncMock()
 
         ctx = MagicMock()
         ctx.bot.token = "tok"
+        ctx.bot.send_message = AsyncMock()
 
         client._allowed_user_ids = set()
         await client._handle_text_message(update, ctx)
 
-        update.message.reply_text.assert_called_once_with("一般回覆")
-        client.send.assert_not_called()
+        ctx.bot.send_message.assert_called_once_with(chat_id=123, text="一般回覆")
 
     @pytest.mark.asyncio
     async def test_dict_reply_with_booking_url(self):
@@ -548,11 +546,11 @@ class TestTelegramPhoneFallback:
         from clients.telegram_client import TelegramClient
 
         client = TelegramClient()
+        client._BATCH_DELAY = 0
         client._on_message = AsyncMock(return_value={
             "text": "找到了！",
             "booking_url": "https://book.example.com",
         })
-        client.send = AsyncMock()
         client._token_to_persona = {"tok": "jarvis"}
 
         update = MagicMock()
@@ -560,17 +558,17 @@ class TestTelegramPhoneFallback:
         update.message.chat_id = 456
         update.message.from_user.id = 1
         update.message.from_user.first_name = "Ted"
-        update.message.reply_text = AsyncMock()
 
         ctx = MagicMock()
         ctx.bot.token = "tok"
+        ctx.bot.send_message = AsyncMock()
 
         client._allowed_user_ids = set()
         await client._handle_text_message(update, ctx)
 
-        client.send.assert_called_once_with(
-            "https://book.example.com", persona="jarvis", chat_id=456
-        )
+        calls = [c.kwargs for c in ctx.bot.send_message.call_args_list]
+        texts = [c["text"] for c in calls]
+        assert "https://book.example.com" in texts
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -685,7 +683,9 @@ class TestBookingIntegration:
         ceo.emotion = None
         ceo.skills = None
 
-        result = await ceo.handle_message("幫我訂明天晚上6點的滿築火鍋五個人")
+        # Skip Agent SDK dispatch so test exercises the booking flow
+        with patch.object(ceo, "_get_agent_executor", return_value=None):
+            result = await ceo.handle_message("幫我訂明天晚上6點的滿築火鍋五個人")
 
         # Should return dict with phone (no booking_url, so goes through LLM)
         assert isinstance(result, dict)

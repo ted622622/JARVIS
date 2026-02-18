@@ -86,6 +86,10 @@ class TelegramClient:
         # Patch O: CEO reference for complexity estimation
         self._ceo_ref = None
 
+        # Patch R: Message batching — accumulate rapid messages
+        self._msg_batch: dict[int, dict[str, Any]] = {}  # chat_id → batch info
+        self._BATCH_DELAY = 6.0  # seconds to wait for more messages
+
         # Voice components (injected after init)
         self._voice_worker = None
         self._stt_client = None
@@ -373,7 +377,12 @@ class TelegramClient:
             await update.message.reply_text(text)
 
     async def _handle_text_message(self, update: Update, context: Any) -> None:
-        """Process incoming text messages from users."""
+        """Accumulate rapid messages into a batch, then process together.
+
+        Patch R: Instead of processing each message immediately, we wait
+        _BATCH_DELAY seconds for more messages. This creates natural
+        couple-chat flow where 2-3 rapid messages are handled as one.
+        """
         if not update.message or not update.message.text:
             return
 
@@ -381,13 +390,12 @@ class TelegramClient:
         user_id = update.message.from_user.id if update.message.from_user else None
         if not self._is_authorized(user_id):
             logger.warning(f"Unauthorized user {user_id} blocked")
-            return  # Silent drop
+            return
 
         chat_id = update.message.chat_id
         user_text = update.message.text
         user_name = update.message.from_user.first_name if update.message.from_user else "User"
 
-        # Determine which persona received this message
         bot_token = context.bot.token
         persona = self._token_to_persona.get(bot_token, "jarvis")
 
@@ -397,62 +405,158 @@ class TelegramClient:
             await update.message.reply_text("收到，但 CEO Agent 尚未就緒。")
             return
 
-        # ── Patch O: Long-task acknowledgement ──────────────────
+        # ── Patch R: Batch accumulation ──
+        if chat_id in self._msg_batch:
+            batch = self._msg_batch[chat_id]
+            batch["messages"].append(user_text)
+        else:
+            batch = {
+                "messages": [user_text],
+                "task": None,
+                "persona": persona,
+                "bot": context.bot,
+            }
+            self._msg_batch[chat_id] = batch
+
+        # Cancel previous batch timer, start fresh
+        if batch["task"] and not batch["task"].done():
+            batch["task"].cancel()
+        batch["task"] = asyncio.create_task(self._process_batch(chat_id))
+
+        # Immediate mode (no batching): await inline — used for testing
+        if self._BATCH_DELAY <= 0:
+            await batch["task"]
+
+    async def _process_batch(self, chat_id: int) -> None:
+        """Wait for batch delay, then process accumulated messages."""
+        try:
+            await asyncio.sleep(self._BATCH_DELAY)
+        except asyncio.CancelledError:
+            return  # Timer reset by new incoming message
+
+        batch = self._msg_batch.pop(chat_id, None)
+        if not batch or not batch["messages"]:
+            return
+
+        persona = batch["persona"]
+        bot = batch["bot"]
+        messages = batch["messages"]
+        combined = "\n".join(messages)
+
+        if len(messages) > 1:
+            logger.info(f"[{persona}] Batch: {len(messages)} messages combined")
+
+        # ── Patch O: Long-task acknowledgement ──
         if self._ceo_ref and hasattr(self._ceo_ref, "estimate_complexity"):
             try:
-                complexity = self._ceo_ref.estimate_complexity(user_text)
+                complexity = self._ceo_ref.estimate_complexity(combined)
                 if complexity["is_long"]:
                     est = complexity["estimate_seconds"]
                     if persona == "clawra":
                         ack = f"欸收到！讓我看看...大概要等個 {est} 秒左右喔～"
                     else:
                         ack = f"收到，正在處理中。預計需要 {est} 秒。"
-                    await update.message.reply_text(ack)
+                    await bot.send_message(chat_id=chat_id, text=ack)
             except Exception as e:
                 logger.debug(f"Complexity estimation failed: {e}")
 
         try:
-            reply = await self._on_message(user_text, chat_id, persona)
+            reply = await self._on_message(combined, chat_id, persona)
 
             # Clawra typing delay — humanize response timing
             if persona == "clawra":
                 reply_text = reply.get("text", "") if isinstance(reply, dict) else (reply or "")
-                await self._simulate_typing(context.bot, chat_id, reply_text)
+                await self._simulate_typing(bot, chat_id, reply_text)
 
-            # Patch O: friendly fallback for empty replies
-            _empty_fallback = (
-                "嗯...我想了一下但不太確定怎麼回，你可以換個方式問問看嗎～"
-                if persona == "clawra"
-                else "Sir, 我已處理完成，但未能產生有效回覆。請換個方式描述您的需求。"
-            )
-
-            if isinstance(reply, dict):
-                # Rich reply — may include photo, phone, booking_url
-                photo_url = reply.get("photo_url")
-                text = reply.get("text", "")
-                phone = reply.get("phone")
-                booking_url = reply.get("booking_url")
-                if photo_url:
-                    try:
-                        await update.message.reply_photo(photo=photo_url, caption=text or None)
-                    except Exception as e:
-                        logger.warning(f"Failed to send photo, sending as text: {e}")
-                        await self._send_long_text(update, text or _empty_fallback)
-                else:
-                    await self._send_long_text(update, text or _empty_fallback)
-                # K3: Send phone number as separate message (TG auto-detects clickable phone)
-                if phone:
-                    await self.send(phone, persona=persona, chat_id=chat_id)
-                if booking_url:
-                    await self.send(booking_url, persona=persona, chat_id=chat_id)
-            else:
-                await self._send_long_text(update, reply or _empty_fallback)
+            await self._send_reply(bot, chat_id, persona, reply)
         except Exception as e:
-            logger.error(f"[{persona}] Message handler error: {e}")
-            if persona == "clawra":
-                await update.message.reply_text("欸...我這邊好像出了點小狀況 >< 等我一下喔～")
+            logger.error(f"[{persona}] Batch handler error: {e}")
+            fallback = (
+                "欸...我這邊好像出了點小狀況 >< 等我一下喔～"
+                if persona == "clawra"
+                else "Sir, 系統暫時出了點問題，我正在處理中。"
+            )
+            try:
+                await bot.send_message(chat_id=chat_id, text=fallback)
+            except Exception:
+                pass
+
+    async def _send_reply(
+        self, bot: Any, chat_id: int, persona: str, reply,
+    ) -> None:
+        """Send CEO reply. Clawra splits long text into multiple messages."""
+        _empty_fallback = (
+            "嗯...我想了一下但不太確定怎麼回，你可以換個方式問問看嗎～"
+            if persona == "clawra"
+            else "Sir, 我已處理完成，但未能產生有效回覆。請換個方式描述您的需求。"
+        )
+
+        if isinstance(reply, dict):
+            photo_url = reply.get("photo_url")
+            text = reply.get("text", "")
+            phone = reply.get("phone")
+            booking_url = reply.get("booking_url")
+
+            if photo_url:
+                try:
+                    await bot.send_photo(
+                        chat_id=chat_id, photo=photo_url, caption=text or None,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send photo, sending as text: {e}")
+                    await self._send_split_text(bot, chat_id, persona, text or _empty_fallback)
             else:
-                await update.message.reply_text("Sir, 系統暫時出了點問題，我正在處理中。")
+                await self._send_split_text(bot, chat_id, persona, text or _empty_fallback)
+
+            if phone:
+                await bot.send_message(chat_id=chat_id, text=phone)
+            if booking_url:
+                await bot.send_message(chat_id=chat_id, text=booking_url)
+        else:
+            await self._send_split_text(bot, chat_id, persona, reply or _empty_fallback)
+
+    async def _send_split_text(
+        self, bot: Any, chat_id: int, persona: str, text: str,
+    ) -> None:
+        """Send text with paragraph splitting for Clawra, plain for JARVIS.
+
+        Clawra messages with multiple paragraphs are split into separate
+        Telegram messages with short typing delays between them, mimicking
+        natural chat behavior.
+        """
+        # Clawra: split at paragraph breaks for natural multi-message flow
+        if persona == "clawra" and "\n\n" in text and len(text) > 60:
+            parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+
+            # Merge into max 3 groups if too many paragraphs
+            if len(parts) > 3:
+                third = max(1, len(parts) // 3)
+                parts = [
+                    "\n\n".join(parts[:third]),
+                    "\n\n".join(parts[third : 2 * third]),
+                    "\n\n".join(parts[2 * third :]),
+                ]
+
+            for i, part in enumerate(parts):
+                if i > 0:
+                    delay = random.uniform(2, 4)
+                    try:
+                        await bot.send_chat_action(chat_id=chat_id, action="typing")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(delay)
+
+                for chunk_start in range(0, len(part), 4000):
+                    await bot.send_message(
+                        chat_id=chat_id, text=part[chunk_start : chunk_start + 4000],
+                    )
+        else:
+            # JARVIS or short Clawra reply: single message
+            if len(text) > 4000:
+                for i in range(0, len(text), 4000):
+                    await bot.send_message(chat_id=chat_id, text=text[i : i + 4000])
+            else:
+                await bot.send_message(chat_id=chat_id, text=text)
 
     async def _handle_voice_message(self, update: Update, context: Any) -> None:
         """Process incoming voice messages: STT → CEO → TTS → reply voice."""

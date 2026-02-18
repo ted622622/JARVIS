@@ -505,8 +505,8 @@ class TestSelfieSceneAndPending:
             },
         })
 
+        # Regex pre-match skips LLM judge, so only CEO reply mock needed
         mock_router.chat.side_effect = [
-            ChatResponse(content="SKILL:selfie", model="test", usage={}),
             ChatResponse(content="等等喔～", model="test", usage={}),
         ]
 

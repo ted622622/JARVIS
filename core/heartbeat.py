@@ -306,6 +306,15 @@ class Heartbeat:
             except Exception:
                 pass
 
+        # Agent SDK token usage
+        ceo = getattr(self, "ceo", None)
+        if ceo and hasattr(ceo, "_agent_executor") and ceo._agent_executor:
+            try:
+                parts.append("")
+                parts.append(ceo._agent_executor.get_usage_line())
+            except Exception:
+                pass
+
         brief = "\n".join(parts)
 
         if self.telegram:

@@ -2,6 +2,8 @@
 
 Uses google-genai SDK for async embedding, numpy for cosine similarity.
 Falls back to pure BM25 when GEMINI_API_KEY is unavailable.
+
+Patch T: Temporal Decay + MMR re-ranking in HybridSearch post-processing.
 """
 
 from __future__ import annotations
@@ -9,7 +11,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
+from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -298,11 +303,81 @@ class HybridSearch:
             })
 
         results.sort(key=lambda x: x["score"], reverse=True)
+
+        # Patch T: post-processing — temporal decay + MMR
+        results = self._apply_temporal_decay(results)
+        results = self._apply_mmr(results, top_k)
+
         return results[:top_k]
 
     def search_sync(self, query: str, top_k: int = 6) -> list[dict]:
         """Pure BM25 fallback for non-async contexts."""
         return self.bm25.search(query, top_k=top_k)
+
+    # ── Patch T: Temporal Decay ────────────────────────────────────
+
+    DECAY_LAMBDA = 0.01  # half-life ~69 days; 30d→74%, 180d→16%
+
+    @staticmethod
+    def _extract_date_from_source(source: str) -> datetime | None:
+        """Try to extract YYYY-MM-DD date from a source file path."""
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", source)
+        if m:
+            try:
+                return datetime.strptime(m.group(1), "%Y-%m-%d")
+            except ValueError:
+                return None
+        return None
+
+    def _apply_temporal_decay(self, results: list[dict]) -> list[dict]:
+        """Multiply scores by exp(-λ * days_old).
+
+        Items without a parseable date in source are not decayed (conservative).
+        """
+        now = datetime.now()
+        decayed = []
+        for r in results:
+            source_date = self._extract_date_from_source(r.get("source", ""))
+            if source_date is not None:
+                days_old = max(0, (now - source_date).days)
+                factor = math.exp(-self.DECAY_LAMBDA * days_old)
+                decayed.append({**r, "score": r["score"] * factor})
+            else:
+                decayed.append(r)
+        decayed.sort(key=lambda x: x["score"], reverse=True)
+        return decayed
+
+    # ── Patch T: MMR Re-ranking ────────────────────────────────────
+
+    MMR_THRESHOLD = 0.7  # text similarity threshold for dedup
+
+    @staticmethod
+    def _text_similarity(a: str, b: str) -> float:
+        """Compute text similarity using SequenceMatcher."""
+        return SequenceMatcher(None, a[:500], b[:500]).ratio()
+
+    def _apply_mmr(self, results: list[dict], top_k: int) -> list[dict]:
+        """Remove near-duplicate results by text similarity.
+
+        Keeps the higher-scored item when similarity > MMR_THRESHOLD.
+        Returns at most top_k items.
+        """
+        if len(results) <= 1:
+            return results
+
+        selected: list[dict] = []
+        for candidate in results:
+            is_dup = False
+            for kept in selected:
+                sim = self._text_similarity(candidate["text"], kept["text"])
+                if sim > self.MMR_THRESHOLD:
+                    is_dup = True
+                    break
+            if not is_dup:
+                selected.append(candidate)
+            if len(selected) >= top_k:
+                break
+        return selected
 
     @staticmethod
     def _normalize(results: list[dict]) -> list[dict]:
