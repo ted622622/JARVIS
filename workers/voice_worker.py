@@ -134,6 +134,44 @@ class VoiceWorker:
             "</voice></speak>"
         )
 
+    @staticmethod
+    def _trim_leading_tone(raw_wav: bytes, trim_ms: int = 150) -> bytes:
+        """Trim the first *trim_ms* milliseconds from GLM-TTS WAV output.
+
+        GLM-TTS embeds a ~120 ms constant-amplitude tone at the start of
+        every audio file.  Trimming the first 150 ms removes it cleanly
+        without cutting into the actual speech (there's a silence gap
+        between the tone and the first spoken word).
+
+        Returns cleaned WAV bytes.  On any error, returns the original.
+        """
+        try:
+            src = wave.open(io.BytesIO(raw_wav), "rb")
+            framerate = src.getframerate()
+            n_channels = src.getnchannels()
+            sampwidth = src.getsampwidth()
+            n_frames = src.getnframes()
+
+            skip_frames = int(framerate * trim_ms / 1000)
+            if skip_frames >= n_frames:
+                src.close()
+                return raw_wav  # audio shorter than trim window — keep as-is
+
+            src.readframes(skip_frames)  # advance past the tone
+            remaining = src.readframes(n_frames - skip_frames)
+            src.close()
+
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as dst:
+                dst.setnchannels(n_channels)
+                dst.setsampwidth(sampwidth)
+                dst.setframerate(framerate)
+                dst.writeframes(remaining)
+            return buf.getvalue()
+        except Exception as e:
+            logger.debug(f"WAV trim skipped ({e}), using raw")
+            return raw_wav
+
     async def _zhipu_tts(self, text: str, persona: str, out_path: Path) -> bool:
         """Generate speech via Zhipu GLM-TTS REST API. Returns True on success."""
         if not self.zhipu_key:
@@ -162,13 +200,16 @@ class VoiceWorker:
                 )
                 return False
 
-            # GLM-TTS returns WAV which Telegram send_voice can't play cleanly.
-            # Convert WAV → MP3 via ffmpeg for proper Telegram voice playback.
+            # GLM-TTS returns WAV with a ~120ms tone/beep at the start
+            # (baked into the PCM data by the model).  We trim it, then
+            # convert WAV → MP3 via ffmpeg for Telegram compatibility.
             raw_wav = resp.content
+            trimmed_wav = self._trim_leading_tone(raw_wav)
+
             if _HAS_FFMPEG:
                 tmp_wav = out_path.with_suffix(".tmp.wav")
                 try:
-                    tmp_wav.write_bytes(raw_wav)
+                    tmp_wav.write_bytes(trimmed_wav)
                     result = subprocess.run(
                         [
                             "ffmpeg", "-y", "-i", str(tmp_wav),
@@ -179,22 +220,12 @@ class VoiceWorker:
                     )
                     if result.returncode != 0:
                         logger.warning(f"ffmpeg WAV→MP3 failed: {result.stderr[:200]}")
-                        out_path.write_bytes(raw_wav)
+                        out_path.write_bytes(trimmed_wav)
                 finally:
                     tmp_wav.unlink(missing_ok=True)
             else:
-                # No ffmpeg — write clean WAV (strip AIGC metadata chunk)
-                try:
-                    src = wave.open(io.BytesIO(raw_wav), "rb")
-                    params = src.getparams()
-                    frames = src.readframes(src.getnframes())
-                    src.close()
-                    with wave.open(str(out_path), "wb") as dst:
-                        dst.setparams(params)
-                        dst.writeframes(frames)
-                except Exception as wav_err:
-                    logger.debug(f"WAV re-write skipped ({wav_err}), using raw")
-                    out_path.write_bytes(raw_wav)
+                # No ffmpeg — write trimmed WAV directly
+                out_path.write_bytes(trimmed_wav)
 
             size = out_path.stat().st_size
             if size == 0:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import wave
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1225,6 +1227,57 @@ class TestVoiceTextCleaner:
 
 
 # ── Selfie Worker Dual Mode ──────────────────────────────────
+
+
+class TestTrimLeadingTone:
+    """GLM-TTS embeds a ~120ms tone at start — _trim_leading_tone removes it."""
+
+    def _make_wav(self, framerate: int = 24000, n_frames: int = 12000,
+                  sampwidth: int = 2, n_channels: int = 1) -> bytes:
+        """Create a valid WAV with sequential frame values."""
+        import struct
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(n_channels)
+            w.setsampwidth(sampwidth)
+            w.setframerate(framerate)
+            # Write frames: 0,1,2,... so we can verify which were kept
+            data = b"".join(struct.pack("<h", i % 32000) for i in range(n_frames))
+            w.writeframes(data)
+        return buf.getvalue()
+
+    def test_trims_150ms(self, tmp_path):
+        raw = self._make_wav(framerate=24000, n_frames=12000)  # 500ms total
+        trimmed = VoiceWorker._trim_leading_tone(raw, trim_ms=150)
+        assert trimmed != raw
+
+        # Verify shorter by ~150ms worth of frames
+        with wave.open(io.BytesIO(raw), "rb") as src:
+            orig_frames = src.getnframes()
+        with wave.open(io.BytesIO(trimmed), "rb") as dst:
+            new_frames = dst.getnframes()
+        expected_skip = int(24000 * 150 / 1000)  # 3600
+        assert new_frames == orig_frames - expected_skip
+
+    def test_no_trim_if_audio_shorter_than_window(self, tmp_path):
+        # 100ms audio, 150ms trim window → should return original
+        raw = self._make_wav(framerate=24000, n_frames=2400)  # 100ms
+        trimmed = VoiceWorker._trim_leading_tone(raw, trim_ms=150)
+        assert trimmed == raw
+
+    def test_returns_raw_on_invalid_input(self):
+        bad = b"not a wav file"
+        result = VoiceWorker._trim_leading_tone(bad)
+        assert result == bad
+
+    def test_valid_wav_output(self):
+        raw = self._make_wav()
+        trimmed = VoiceWorker._trim_leading_tone(raw)
+        # Should be parseable as WAV
+        with wave.open(io.BytesIO(trimmed), "rb") as w:
+            assert w.getnchannels() == 1
+            assert w.getsampwidth() == 2
+            assert w.getframerate() == 24000
 
 
 class TestClawraVoice:
