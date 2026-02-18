@@ -653,9 +653,12 @@ class Heartbeat:
         Returns cleanup result dict (for testing).
         """
         result = {"reminders_removed": 0}
-        if self.reminder:
-            result["reminders_removed"] = self.reminder.cleanup(days=7)
-        logger.info(f"Memory cleanup: {result}")
+        try:
+            if self.reminder:
+                result["reminders_removed"] = self.reminder.cleanup(days=7)
+            logger.info(f"Memory cleanup: {result}")
+        except Exception as e:
+            logger.error(f"Memory cleanup failed: {e}")
         return result
 
     # ── Clawra Proactive Behavior ────────────────────────────────

@@ -83,6 +83,10 @@ class MarkdownMemory:
             header = f"# {now.strftime('%Y-%m-%d')} 日誌\n\n"
             path.write_text(header, encoding="utf-8")
 
+        # Substitute common LLM template placeholders
+        entry = entry.replace("{當前時間}", now.strftime("%Y-%m-%d %H:%M"))
+        entry = entry.replace("{current_time}", now.strftime("%Y-%m-%d %H:%M"))
+
         timestamp = now.strftime("%H:%M")
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"- [{timestamp}] {entry}\n")

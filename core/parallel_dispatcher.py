@@ -2,6 +2,9 @@
 
 Uses ``asyncio.gather`` with ``return_exceptions=True`` so one failing
 worker never blocks the others.
+
+NOTE: Currently not wired into any live flow. Kept for future Phase 3
+      multi-task parallel dispatch. See jarvis_diagnostic_20260219.md A1-3.
 """
 
 from __future__ import annotations

@@ -197,11 +197,61 @@ class GogWorker:
     # ── Generic execute (worker interface) ────────────────────────
 
     async def execute(self, task: str, **kwargs: Any) -> dict[str, Any]:
-        """Worker interface — dispatch by task description."""
+        """Worker interface — dispatch by task description.
+
+        Parses the task string to route to the appropriate specific method.
+        """
         if not self._available:
             return {"error": "gog CLI not installed", "worker": self.name}
+
+        task_lower = task.lower()
+
+        # ── Calendar ──
+        if any(kw in task_lower for kw in (
+            "行事曆", "日程", "calendar", "schedule", "會議", "meeting",
+            "約", "預約", "appointment", "event", "agenda",
+        )):
+            if any(kw in task_lower for kw in ("新增", "加入", "create", "add", "建立")):
+                return {
+                    "content": "請使用 create_event() 方法建立事件（需要標題和時間）。",
+                    "worker": self.name,
+                }
+            if "明天" in task_lower:
+                tomorrow = datetime.now() + timedelta(days=1)
+                events = self.get_events_for_date(tomorrow)
+            elif any(kw in task_lower for kw in ("upcoming", "接下來", "下一個")):
+                events = self.get_upcoming_events(minutes=120)
+            else:
+                events = self.get_today_events()
+            return {"content": json.dumps(events, ensure_ascii=False), "worker": self.name}
+
+        # ── Email ──
+        if any(kw in task_lower for kw in (
+            "email", "信", "mail", "寄", "發信", "收件", "inbox", "gmail",
+        )):
+            if any(kw in task_lower for kw in ("寄", "發", "send")):
+                return {
+                    "content": "請使用 send_email(to, subject, body) 方法發信。",
+                    "worker": self.name,
+                }
+            query = kwargs.get("query", "newer_than:1d")
+            results = self.search_inbox(query=query)
+            return {"content": json.dumps(results, ensure_ascii=False), "worker": self.name}
+
+        # ── Drive ──
+        if any(kw in task_lower for kw in (
+            "drive", "雲端", "檔案", "file", "document", "文件",
+        )):
+            query = kwargs.get("query", task[:50])
+            results = self.search_drive(query=query)
+            return {"content": json.dumps(results, ensure_ascii=False), "worker": self.name}
+
+        # ── Fallback: try calendar (most common use case) ──
+        events = self.get_today_events()
+        if events:
+            return {"content": json.dumps(events, ensure_ascii=False), "worker": self.name}
+
         return {
-            "status": "ready",
-            "note": "Use specific methods (get_today_events, etc.)",
+            "content": f"無法辨識任務類型: {task[:80]}",
             "worker": self.name,
         }

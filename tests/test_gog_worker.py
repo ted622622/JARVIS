@@ -273,7 +273,7 @@ class TestGogExecute:
             gog = GogWorker()
             result = await gog.execute("check calendar")
             assert result["worker"] == "gog"
-            assert "status" in result
+            assert "content" in result
 
     @pytest.mark.asyncio
     async def test_execute_not_available(self):

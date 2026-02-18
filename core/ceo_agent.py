@@ -55,6 +55,8 @@ _COMPLEX_PATTERNS = re.compile(
     r"幫我寫一[份篇封]|幫我整理|"
     r"做一個.*計畫|規劃.*行程|"
     r"查.*然後.*整理|搜.*然後.*比較|"
+    r"研究一下|分析一下|比較一下|調查|評估|彙整|"   # bare research verbs
+    r"寫一份|產出.*報告|"                             # output-oriented
     r"步驟|流程|完整",
     re.IGNORECASE,
 )
@@ -67,6 +69,12 @@ _SIMPLE_PATTERNS = re.compile(
 
 # Pattern for LLM tool calls in response text (fallback)
 _TOOL_PATTERN = re.compile(r'\[(?:FETCH|SEARCH|MAPS):([^\]]+)\]')
+
+# ── Research hint (Phase 3.1) ────────────────────────────────────
+_RESEARCH_HINT_PATTERN = re.compile(
+    r"研究|分析|比較|調查|評估|彙整|整理.*資料",
+    re.IGNORECASE,
+)
 
 # ── Patch O: Long-task detection ─────────────────────────────────
 _LONG_TASK_TYPES = frozenset({"web_search", "web_browse", "restaurant_booking", "code"})
@@ -87,6 +95,9 @@ _STRUCTURED_MARKERS = re.compile(r"^#{1,4}\s|^>\s|^---$|^```|^\- \[", re.MULTILI
 _TASK_TEMPLATE_PATTERN = re.compile(r"（[^）]*內容[^）]*）|（[^）]*填入[^）]*）|\{\{.+?\}\}")
 # GitHub repo references: owner/repo patterns (for proactive fetch in task templates)
 _GITHUB_REPO_PATTERN = re.compile(r'\b([A-Za-z][\w.-]+/[A-Za-z][\w.-]+)\b')
+
+# ── Silent reply token ────────────────────────────────────────────
+SILENT_TOKEN = "[SILENT]"
 
 # ── LLM reply cleanup (strip leaked thinking tags) ────────────────
 _THINK_TAG_PATTERN = re.compile(r"</?think>", re.IGNORECASE)
@@ -173,6 +184,8 @@ _WEB_NEED_PATTERNS = re.compile(
     r"(?:天氣|新聞|行情).*?(?:怎[麼樣]|如何|多少|什麼)|"
     r"(?:股價|匯率|比特幣|bitcoin|btc|eth|加密貨幣).*?(?:多少|現在|今天|幾|漲|跌)?|"
     r"多少錢|哪裡買|怎麼去|幾點.*?(?:開|關|營業)|"
+    r"評價|review|推薦|recommend|"            # reviews / recommendations
+    r"哪家好|哪間|哪個.*?好|"                   # which one is better
     r"https?://\S+",
     re.IGNORECASE,
 )
@@ -535,6 +548,18 @@ class CEOAgent:
             self._last_skill_failure = None
         if was_silent:
             extra_ctx["just_recovered"] = "你剛休息完回來，用符合角色的方式打個招呼，然後回答用戶的問題"
+
+        # Inject structured output hint for research tasks
+        if _RESEARCH_HINT_PATTERN.search(user_message):
+            extra_ctx["研究指引"] = (
+                "這是研究型任務，請用以下結構回答：\n"
+                "### 背景\n簡述問題背景（2-3 句）\n"
+                "### 發現\n列出主要發現（每項 1-2 句）\n"
+                "### 來源\n列出你參考的資訊來源\n"
+                "### 信心度\n高/中/低 — 說明原因\n\n"
+                "如果一次搜尋不夠，請多次使用 [SEARCH:] 深入查詢。"
+            )
+
         system_prompt = self._build_system_prompt(
             active_persona, emotion_label, extra_ctx or None
         )
@@ -547,11 +572,20 @@ class CEOAgent:
         web_ctx_len = len(extra_ctx.get("網路搜尋結果", "")) if extra_ctx else 0
         needs_long_reply = web_ctx_len > _SEARCH_CHAR_LIMIT or len(user_message) > 500
         ceo_max_tokens = 4096 if needs_long_reply else 500
-        response = await self.router.chat(
-            messages,
-            role=ModelRole.CEO,
-            max_tokens=ceo_max_tokens,
-        )
+        try:
+            response = await asyncio.wait_for(
+                self.router.chat(
+                    messages,
+                    role=ModelRole.CEO,
+                    max_tokens=ceo_max_tokens,
+                ),
+                timeout=120,
+            )
+        except asyncio.TimeoutError:
+            logger.error("CEO LLM call timeout (120s)")
+            if active_persona == "clawra":
+                return "嗯...我剛剛有點恍神，你可以再說一次嗎？"
+            return "Sir, 回覆處理超時。請再試一次。"
         reply = _clean_llm_reply(response.content)
 
         # Record token usage for pool balancing
@@ -564,14 +598,22 @@ class CEOAgent:
             if not tool_matches:
                 break
 
-            # Execute all tool calls found in this round
-            all_results = []
+            # Execute all tool calls found in this round (parallel)
+            tool_tasks = []
+            tag_labels = []
             for match in _TOOL_PATTERN.finditer(reply):
                 tag = match.group(0).split(":")[0].lstrip("[")
                 query_or_url = match.group(1).strip()
-                tool_result = await self._execute_tool_call(query_or_url, tag=tag)
-                if tool_result:
-                    all_results.append(f"[{tag}:{query_or_url[:60]}]\n{tool_result}")
+                tool_tasks.append(self._execute_tool_call(query_or_url, tag=tag))
+                tag_labels.append((tag, query_or_url[:60]))
+
+            raw_results = await asyncio.gather(*tool_tasks, return_exceptions=True)
+            all_results = []
+            for (tag, label), result in zip(tag_labels, raw_results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Tool call [{tag}:{label}] failed: {result}")
+                elif result:
+                    all_results.append(f"[{tag}:{label}]\n{result}")
 
             if not all_results:
                 break
@@ -586,11 +628,28 @@ class CEOAgent:
                     "不要再使用 [FETCH:] 或 [SEARCH:] 標記。直接給出完整回覆。"
                 ),
             ))
-            followup = await self.router.chat(
-                messages, role=ModelRole.CEO, max_tokens=4096,
-            )
+            try:
+                followup = await asyncio.wait_for(
+                    self.router.chat(
+                        messages, role=ModelRole.CEO, max_tokens=4096,
+                    ),
+                    timeout=120,
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Tool-use followup timeout (round {_tool_round + 1})")
+                break
             reply = _clean_llm_reply(followup.content)
             logger.debug(f"Tool-use round {_tool_round + 1} reply length: {len(reply or '')}")
+
+        # Strip any unresolved tool tags that leaked through 3 rounds
+        if reply:
+            reply = _TOOL_PATTERN.sub("", reply).strip()
+
+        # Silent reply — LLM decided no response is needed
+        if reply and reply.strip() == SILENT_TOKEN:
+            logger.debug("CEO returned SILENT_TOKEN — no reply sent")
+            await self._store_conversation(user_message, "(silent)", session_id)
+            return None
 
         # Patch O: Log reply before returning + empty reply guard
         logger.debug(
@@ -1368,44 +1427,55 @@ class CEOAgent:
         emotion: str,
         context: dict[str, Any] | None,
     ) -> str:
-        """Construct the full system prompt."""
-        extra_parts = []
+        """Construct the full system prompt with structured sections."""
+        sections: list[str] = []
 
+        # Section 1: Soul / persona
+        if self.soul and self.soul.is_loaded:
+            sections.append("## 角色設定\n" + self.soul.build_system_prompt(persona))
+        else:
+            sections.append(
+                "## 角色設定\n"
+                "你是 J.A.R.V.I.S.，Ted 的 AI 管家。"
+                "結論先行，回覆不超過 500 Token。"
+            )
+
+        # Section 2: Context (emotion, memory, task hints)
+        ctx_parts = []
         if emotion != "normal":
-            extra_parts.append(f"用戶當前情緒: {emotion}")
-
+            ctx_parts.append(f"用戶當前情緒: {emotion}")
         if context:
             for k, v in context.items():
-                extra_parts.append(f"{k}: {v}")
-
-        # J4: Inject shared memory context for Clawra
+                ctx_parts.append(f"{k}: {v}")
         if persona == "clawra" and self._shared_memory:
             try:
                 moments_ctx = self._shared_memory.get_context_for_prompt()
                 if moments_ctx:
-                    extra_parts.append(f"共同記憶: {moments_ctx}")
+                    ctx_parts.append(f"共同記憶: {moments_ctx}")
             except Exception:
                 pass
+        if ctx_parts:
+            sections.append("## 當前上下文\n" + "\n".join(ctx_parts))
 
-        extra = "\n".join(extra_parts)
-
-        if self.soul and self.soul.is_loaded:
-            base = self.soul.build_system_prompt(persona, extra)
-        else:
-            base = (
-                "你是 J.A.R.V.I.S.，Ted 的 AI 管家。"
-                "結論先行，回覆不超過 500 Token。"
-            )
-            if extra:
-                base += f"\n{extra}"
-
-        # Append tool-use instructions if browser worker available
+        # Section 3: Tools
         if self.workers.get("browser"):
-            base += self._TOOL_INSTRUCTIONS
+            sections.append("## 工具使用" + self._TOOL_INSTRUCTIONS)
 
-        # Voice capability declaration
+        # Section 4: Capabilities
+        caps = []
         if self.workers.get("voice"):
-            base += "\n\n你擁有語音回覆能力，不要說你無法回語音或傳送語音訊息。"
+            caps.append("你擁有語音回覆能力，不要說你無法回語音或傳送語音訊息。")
+        if caps:
+            sections.append("## 能力\n" + "\n".join(caps))
+
+        # Section 5: Reply rules
+        sections.append(
+            "## 回覆規則\n"
+            "如果你判斷這條訊息不需要回覆（例如用戶只是說「嗯」「ok」「好」），"
+            f"請回覆 {SILENT_TOKEN}，不要強行生成回覆。"
+        )
+
+        base = "\n\n".join(sections)
 
         return base
 
@@ -1415,33 +1485,53 @@ class CEOAgent:
         user_message: str,
         session_id: str | None = None,
     ) -> list[ChatMessage]:
-        """Build message list with system prompt + recent history + new message."""
+        """Build message list with system prompt + recent history + new message.
+
+        Uses ConversationCompressor's compressed summaries + recent turns when
+        available, falls back to MemOS conversation_log for shorter sessions.
+        """
         messages = [ChatMessage(role="system", content=system_prompt)]
 
-        # Load recent conversation history from MemOS
-        sid = session_id or self._session_id
-        if self.memos:
-            try:
-                history = await self.memos.get_conversation(
-                    session_id=sid, limit=6
-                )
-                for entry in history:
-                    content = entry.get("content", "")
-                    # Filter out poisoned replies that refuse text processing
-                    if entry.get("role") == "assistant" and (
-                        "無法克隆" in content
-                        or "無法存取檔案" in content
-                        or "無法執行" in content
-                        or "无法克隆" in content
-                        or "无法访问文件" in content
-                    ):
-                        continue
-                    messages.append(ChatMessage(
-                        role=entry.get("role", "user"),
-                        content=content,
-                    ))
-            except Exception:
-                pass  # No history available
+        # Try compressor first — it has compressed summaries + recent turns
+        compressor_ctx = self._compressor.get_context_for_ceo()
+        if len(compressor_ctx) > 1:  # has more than just a system summary
+            for msg in compressor_ctx:
+                content = msg.get("content", "")
+                role = msg.get("role", "user")
+                # Filter out poisoned replies
+                if role == "assistant" and (
+                    "無法克隆" in content
+                    or "無法存取檔案" in content
+                    or "無法執行" in content
+                    or "无法克隆" in content
+                    or "无法访问文件" in content
+                ):
+                    continue
+                messages.append(ChatMessage(role=role, content=content))
+        else:
+            # Fallback: load from MemOS (short session, compressor has no data)
+            sid = session_id or self._session_id
+            if self.memos:
+                try:
+                    history = await self.memos.get_conversation(
+                        session_id=sid, limit=6
+                    )
+                    for entry in history:
+                        content = entry.get("content", "")
+                        if entry.get("role") == "assistant" and (
+                            "無法克隆" in content
+                            or "無法存取檔案" in content
+                            or "無法執行" in content
+                            or "无法克隆" in content
+                            or "无法访问文件" in content
+                        ):
+                            continue
+                        messages.append(ChatMessage(
+                            role=entry.get("role", "user"),
+                            content=content,
+                        ))
+                except Exception:
+                    pass  # No history available
 
         messages.append(ChatMessage(role="user", content=user_message))
         return messages
@@ -1581,11 +1671,15 @@ class CEOAgent:
 
     # ── Patch T+: Pre-compaction memory flush ────────────────────
 
+    # Categories for MEMORY.md routing
+    _PREF_KEYWORDS = re.compile(r"偏好|喜歡|不喜歡|習慣|prefer|always|never|討厭|愛")
+    _DECISION_KEYWORDS = re.compile(r"決定|選擇|改用|換成|adopt|switch|migrate|決策")
+
     async def _pre_flush_extract(self, turns: list[dict]) -> None:
         """Extract important facts from turns about to be compressed.
 
         Called by ConversationCompressor before discarding old turns.
-        Uses Lite model for cheap extraction, writes to daily memory.
+        Uses Lite model for cheap extraction, writes to daily memory AND MEMORY.md.
         Fully guarded — failure only logs a warning.
         """
         if not self.md_memory or not turns:
@@ -1603,7 +1697,8 @@ class CEOAgent:
             prompt = (
                 "從以下即將被壓縮的對話片段中，提取任何值得長期記住的事實。\n"
                 "每行一條，用「FACT:」開頭。純閒聊輸出 NONE。\n"
-                "只提取：用戶偏好、重要決定、任務進度、承諾事項。\n\n"
+                "只提取：用戶偏好、重要決定、任務進度、承諾事項、個人資訊。\n"
+                "不要用 {模板} 佔位符，直接寫出具體內容。\n\n"
                 f"{conv_text[:3000]}"
             )
 
@@ -1619,14 +1714,24 @@ class CEOAgent:
             if answer == "NONE" or not answer:
                 return
 
+            fact_count = 0
             for line in answer.split("\n"):
                 line = line.strip()
                 if line.startswith("FACT:"):
                     fact = line[5:].strip()
-                    if fact:
-                        self.md_memory.log_daily(f"[pre-flush] {fact}")
+                    if not fact:
+                        continue
+                    fact_count += 1
+                    # Write to daily log
+                    self.md_memory.log_daily(f"[pre-flush] {fact}")
+                    # Route to MEMORY.md by category
+                    if self._PREF_KEYWORDS.search(fact):
+                        self.md_memory.remember(fact, category="用戶偏好")
+                    elif self._DECISION_KEYWORDS.search(fact):
+                        self.md_memory.remember(fact, category="重要決策")
 
-            logger.info(f"Pre-flush extraction completed ({len(turns)} turns)")
+            if fact_count:
+                logger.info(f"Pre-flush: extracted {fact_count} facts ({len(turns)} turns)")
         except Exception as e:
             logger.warning(f"Pre-flush extraction failed: {e}")
 

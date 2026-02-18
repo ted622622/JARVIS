@@ -1,5 +1,9 @@
 """Google Calendar client — dual-account OAuth with conflict detection.
 
+NOTE: Currently not wired into main.py. Calendar access uses gog CLI
+      (GogWorker) instead. Kept for future dual-account conflict detection.
+      See jarvis_diagnostic_20260219.md A1-5.
+
 Features:
 - OAuth 2.0 authorization for two Google accounts
 - Event fetching with configurable time range

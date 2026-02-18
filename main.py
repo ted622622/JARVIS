@@ -200,6 +200,20 @@ async def main() -> None:
         ceo.memory_search = memory_search
         logger.info("  [7c/12] Gemini Embedding skipped (no GEMINI_API_KEY)")
 
+    # Start memory file watcher for auto re-indexing
+    try:
+        from core.memory_watcher import MemoryWatcher
+        _search_ref = ceo.memory_search
+        if hasattr(_search_ref, "build_index") and asyncio.iscoroutinefunction(_search_ref.build_index):
+            mem_watcher = MemoryWatcher(
+                memory_dir="./memory",
+                rebuild_callback=_search_ref.build_index,
+                loop=asyncio.get_event_loop(),
+            )
+            mem_watcher.start()
+    except Exception as e:
+        logger.debug(f"Memory watcher init skipped: {e}")
+
     logger.info("  [7/12] CEO Agent initialized (persona: jarvis)")
 
     # ── Step 8: Initialize Workers ────────────────────────────────
@@ -453,6 +467,13 @@ async def main() -> None:
         logger.info(f"  [10/12] Telegram polling started ({len(tg_apps)} bots)")
     else:
         logger.warning("  [10/12] Telegram polling skipped (no bot token)")
+
+    # ── Security audit ────────────────────────────────────────────
+    try:
+        from core.security_audit import startup_audit
+        audit_findings = startup_audit(".")
+    except Exception as e:
+        logger.debug(f"Security audit skipped: {e}")
 
     # ── Step 12: All systems go ───────────────────────────────────
     logger.info("")

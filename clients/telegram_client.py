@@ -463,6 +463,11 @@ class TelegramClient:
         try:
             reply = await self._on_message(combined, chat_id, persona)
 
+            # Silent reply — CEO decided no response needed
+            if reply is None:
+                logger.debug(f"[{persona}] Silent reply — skipping send")
+                return
+
             # Clawra typing delay — humanize response timing
             if persona == "clawra":
                 reply_text = reply.get("text", "") if isinstance(reply, dict) else (reply or "")
