@@ -13,6 +13,7 @@ import hashlib
 import html
 import io
 import re
+import subprocess
 import wave
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,14 @@ try:
     _HAS_EDGE_TTS = True
 except ImportError:
     _HAS_EDGE_TTS = False
+
+# Ensure static-ffmpeg paths are available (bundles ffmpeg binary)
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+    _HAS_FFMPEG = True
+except ImportError:
+    _HAS_FFMPEG = False
 
 # Voice configuration per persona
 VOICE_MAP: dict[str, str] = {
@@ -153,21 +162,39 @@ class VoiceWorker:
                 )
                 return False
 
-            # GLM-TTS WAV contains a non-standard AIGC metadata chunk that
-            # causes beep artifacts in Telegram voice playback.
-            # Re-write as a clean WAV using stdlib wave module.
+            # GLM-TTS returns WAV which Telegram send_voice can't play cleanly.
+            # Convert WAV → MP3 via ffmpeg for proper Telegram voice playback.
             raw_wav = resp.content
-            try:
-                src = wave.open(io.BytesIO(raw_wav), "rb")
-                params = src.getparams()
-                frames = src.readframes(src.getnframes())
-                src.close()
-                with wave.open(str(out_path), "wb") as dst:
-                    dst.setparams(params)
-                    dst.writeframes(frames)
-            except Exception as wav_err:
-                logger.debug(f"WAV re-write skipped ({wav_err}), using raw")
-                out_path.write_bytes(raw_wav)
+            if _HAS_FFMPEG:
+                tmp_wav = out_path.with_suffix(".tmp.wav")
+                try:
+                    tmp_wav.write_bytes(raw_wav)
+                    result = subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-i", str(tmp_wav),
+                            "-codec:a", "libmp3lame", "-b:a", "128k",
+                            "-ar", "24000", str(out_path),
+                        ],
+                        capture_output=True, timeout=15,
+                    )
+                    if result.returncode != 0:
+                        logger.warning(f"ffmpeg WAV→MP3 failed: {result.stderr[:200]}")
+                        out_path.write_bytes(raw_wav)
+                finally:
+                    tmp_wav.unlink(missing_ok=True)
+            else:
+                # No ffmpeg — write clean WAV (strip AIGC metadata chunk)
+                try:
+                    src = wave.open(io.BytesIO(raw_wav), "rb")
+                    params = src.getparams()
+                    frames = src.readframes(src.getnframes())
+                    src.close()
+                    with wave.open(str(out_path), "wb") as dst:
+                        dst.setparams(params)
+                        dst.writeframes(frames)
+                except Exception as wav_err:
+                    logger.debug(f"WAV re-write skipped ({wav_err}), using raw")
+                    out_path.write_bytes(raw_wav)
 
             size = out_path.stat().st_size
             if size == 0:
@@ -273,7 +300,7 @@ class VoiceWorker:
             emotion: CEO emotion label (reserved for future use)
 
         Returns:
-            Path to the generated audio file (WAV or MP3)
+            Path to the generated MP3 file
 
         Raises:
             VoiceError: If all TTS engines fail
@@ -284,26 +311,22 @@ class VoiceWorker:
         if not text.strip():
             raise VoiceError("Empty text provided for TTS")
 
-        wav_path = self._cache_path(text, persona, ".wav")
-        mp3_path = self._cache_path(text, persona, ".mp3")
+        out_path = self._cache_path(text, persona)
 
-        # Return cached version if exists and non-empty (check both formats)
-        if wav_path.exists() and wav_path.stat().st_size > 0:
-            logger.debug(f"TTS cache hit: {wav_path.name}")
-            return str(wav_path)
-        if mp3_path.exists() and mp3_path.stat().st_size > 0:
-            logger.debug(f"TTS cache hit: {mp3_path.name}")
-            return str(mp3_path)
+        # Return cached version if exists and non-empty
+        if out_path.exists() and out_path.stat().st_size > 0:
+            logger.debug(f"TTS cache hit: {out_path.name}")
+            return str(out_path)
 
-        # Three-tier fallback: GLM-TTS (wav) → Azure (mp3) → edge-tts (mp3)
-        if await self._zhipu_tts(text, persona, wav_path):
-            return str(wav_path)
+        # Three-tier fallback: GLM-TTS (WAV→MP3 via ffmpeg) → Azure → edge-tts
+        if await self._zhipu_tts(text, persona, out_path):
+            return str(out_path)
 
-        if await self._azure_tts(text, persona, mp3_path):
-            return str(mp3_path)
+        if await self._azure_tts(text, persona, out_path):
+            return str(out_path)
 
-        if await self._edge_tts(text, persona, mp3_path):
-            return str(mp3_path)
+        if await self._edge_tts(text, persona, out_path):
+            return str(out_path)
 
         raise VoiceError("All TTS engines failed")
 
