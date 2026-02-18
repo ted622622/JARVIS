@@ -3,6 +3,8 @@
 Patch Q: Randomize hairstyle + seasonal outfit + optional Seoul scene
 in each selfie prompt. Preferences from SOUL_GROWTH.md bias selections.
 
+Patch T+: Framing-specific scene pools (mirror / full_body / medium / closeup).
+
 Usage:
     builder = AppearanceBuilder()
     snippet = builder.build(
@@ -75,6 +77,53 @@ SCENES: list[str] = [
     "in a quiet bookstore corner",
 ]
 
+# ── Patch T+: Framing-specific scene pools ───────────────────────
+
+MIRROR_SCENES: list[str] = [
+    "in her bedroom in front of a full-length mirror",
+    "in a clothing store fitting room mirror",
+    "in the bathroom mirror with soft lighting",
+    "in a dance studio mirror with wooden floor",
+    "in an elevator mirror with warm overhead light",
+    "in a hotel room mirror with city view behind",
+]
+
+FULL_BODY_SCENES: list[str] = [
+    "walking along the Han River promenade",
+    "standing on a Hongdae crosswalk with neon lights",
+    "posing at a Seoul park with autumn leaves",
+    "standing at a rooftop with the Namsan Tower behind",
+    "walking down Garosugil tree-lined street",
+    "standing at a Gyeongbokgung palace courtyard",
+]
+
+MEDIUM_SCENES: list[str] = [
+    "sitting at a Seoul cafe with a latte",
+    "leaning against a bookstore shelf",
+    "at a ramen shop counter with steam rising",
+    "sitting by the window of a cozy restaurant",
+    "at a convenience store with snacks in hand",
+    "on a bench at a quiet Seoul park",
+    "at her desk with a warm lamp",
+    "in a library reading corner with stacked books",
+]
+
+CLOSEUP_SCENES: list[str] = [
+    "with soft bokeh city lights behind",
+    "in golden hour warm sunlight on her face",
+    "with cherry blossom petals softly blurred behind",
+    "under a streetlamp with gentle warm glow",
+    "with raindrops on the window behind",
+    "in soft natural light from a nearby window",
+]
+
+FRAMING_SCENES: dict[str, list[str]] = {
+    "mirror": MIRROR_SCENES,
+    "full_body": FULL_BODY_SCENES,
+    "medium": MEDIUM_SCENES,
+    "closeup": CLOSEUP_SCENES,
+}
+
 # ── Preference tags in SOUL_GROWTH.md ────────────────────────────
 
 _PREF_PATTERN = re.compile(
@@ -141,11 +190,20 @@ class AppearanceBuilder:
     - disliked items are excluded
     """
 
+    # Proactive framing weights (when system picks, not user)
+    _PROACTIVE_WEIGHTS: dict[str, int] = {
+        "medium": 50,
+        "closeup": 30,
+        "full_body": 15,
+        "mirror": 5,
+    }
+
     def build(
         self,
         growth_content: str = "",
         season: str | None = None,
         include_scene: bool = True,
+        framing: str | None = None,
     ) -> str:
         """Compose a full appearance string: hairstyle + outfit + (scene).
 
@@ -153,6 +211,8 @@ class AppearanceBuilder:
             growth_content: raw SOUL_GROWTH.md content for preference parsing
             season: override season (default: auto-detect from current date)
             include_scene: whether to append a Seoul scene
+            framing: framing type (mirror/full_body/medium/closeup) — uses
+                     framing-specific scene pool instead of generic SCENES
         """
         season = season or get_seoul_season()
         prefs = parse_preferences(growth_content)
@@ -161,9 +221,34 @@ class AppearanceBuilder:
         parts.append(self._pick_hairstyle(prefs))
         parts.append(self._pick_outfit(season, prefs))
         if include_scene:
-            parts.append(self._pick_scene(prefs))
+            if framing and framing in FRAMING_SCENES:
+                parts.append(self.select_scene(framing, prefs))
+            else:
+                parts.append(self._pick_scene(prefs))
 
         return ", ".join(parts)
+
+    def select_scene(self, framing: str, prefs: dict[str, Any] | None = None) -> str:
+        """Pick a scene from the framing-specific pool.
+
+        Args:
+            framing: one of "mirror", "full_body", "medium", "closeup"
+            prefs: parsed preferences (optional)
+        """
+        pool = FRAMING_SCENES.get(framing, SCENES)
+        likes = (prefs or {}).get("scene_likes", [])
+        dislikes = (prefs or {}).get("scene_dislikes", [])
+        return _weighted_pick(pool, likes=likes, dislikes=dislikes)
+
+    @classmethod
+    def select_proactive_framing(cls) -> str:
+        """Pick a framing for system-initiated selfies (proactive).
+
+        Weights: medium 50%, closeup 30%, full_body 15%, mirror 5%.
+        """
+        framings = list(cls._PROACTIVE_WEIGHTS.keys())
+        weights = list(cls._PROACTIVE_WEIGHTS.values())
+        return random.choices(framings, weights=weights, k=1)[0]
 
     def _pick_hairstyle(self, prefs: dict[str, Any]) -> str:
         """Pick a random hairstyle, weighted by preferences."""

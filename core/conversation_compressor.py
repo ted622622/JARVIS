@@ -3,11 +3,16 @@
 Keeps the last N turns in full detail, compresses older turns into
 one-line summaries.  Pairs with G2 Memory Flush so that important
 information is saved to Markdown before compression discards it.
+
+Patch T+: Pre-compaction flush — before discarding turns, stage them
+for LLM extraction so important facts are persisted to daily memory.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
 from datetime import datetime
+from typing import Any
 
 
 class ConversationCompressor:
@@ -30,6 +35,11 @@ class ConversationCompressor:
         self.max_summary_lines = max_summary_lines
         self.full_history: list[dict] = []
         self.compressed_summary: list[str] = []
+        # Patch T+: Pre-compaction flush
+        self._pre_flush_callback: Callable[
+            [list[dict]], Coroutine[Any, Any, None]
+        ] | None = None
+        self._pending_flush: list[dict] = []
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -77,6 +87,35 @@ class ConversationCompressor:
         """Clear all history and summaries."""
         self.full_history.clear()
         self.compressed_summary.clear()
+        self._pending_flush.clear()
+
+    # ── Patch T+: Pre-compaction flush ────────────────────────────
+
+    def set_pre_flush_callback(
+        self,
+        callback: Callable[[list[dict]], Coroutine[Any, Any, None]],
+    ) -> None:
+        """Set async callback invoked with turns about to be compressed.
+
+        The callback receives the list of turn dicts that will be discarded.
+        """
+        self._pre_flush_callback = callback
+
+    @property
+    def has_pending_flush(self) -> bool:
+        """True if there are staged turns waiting for extraction."""
+        return len(self._pending_flush) > 0
+
+    async def flush_pending(self) -> None:
+        """Invoke the pre-flush callback with staged turns, then clear."""
+        if not self._pending_flush:
+            return
+        if self._pre_flush_callback is not None:
+            turns = list(self._pending_flush)
+            self._pending_flush.clear()
+            await self._pre_flush_callback(turns)
+        else:
+            self._pending_flush.clear()
 
     # ── Internal ────────────────────────────────────────────────
 
@@ -89,6 +128,10 @@ class ConversationCompressor:
             return
 
         to_compress = self.full_history[:keep_from]
+
+        # Patch T+: Stage turns for pre-flush extraction before discarding
+        if self._pre_flush_callback is not None:
+            self._pending_flush.extend(to_compress)
 
         # Walk through pairs (user, assistant) and build summaries
         i = 0

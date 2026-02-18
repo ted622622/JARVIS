@@ -33,7 +33,7 @@ VOICE_MAP: dict[str, str] = {
 
 # GLM-TTS voice per persona
 ZHIPU_VOICE_MAP: dict[str, str] = {
-    "clawra": "tongtong",    # 彤彤 — 女聲
+    "clawra": "douji",       # 豆吉 — 女聲 (Patch T+)
     "jarvis": "chuichui",    # 錘錘 — 男聲
 }
 

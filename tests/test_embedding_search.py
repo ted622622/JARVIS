@@ -485,21 +485,21 @@ class TestTemporalDecay:
         assert decayed[0]["score"] > 0.99
 
     def test_decay_old_memory_reduced(self):
-        """30-day-old memory should be ~74% of original score."""
+        """30-day-old memory should be reduced by decay (λ from class constant)."""
         old_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
         hs = HybridSearch(bm25=MagicMock(), embedding=None)
         results = [{"text": "test", "source": f"daily/{old_date}.md", "score": 1.0}]
         decayed = hs._apply_temporal_decay(results)
-        expected = math.exp(-0.01 * 30)  # ~0.74
+        expected = math.exp(-hs.DECAY_LAMBDA * 30)
         assert abs(decayed[0]["score"] - expected) < 0.01
 
     def test_decay_very_old_memory(self):
-        """180-day-old memory should be ~16% of original score."""
+        """180-day-old memory should be significantly reduced."""
         old_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
         hs = HybridSearch(bm25=MagicMock(), embedding=None)
         results = [{"text": "test", "source": f"daily/{old_date}.md", "score": 1.0}]
         decayed = hs._apply_temporal_decay(results)
-        expected = math.exp(-0.01 * 180)  # ~0.165
+        expected = math.exp(-hs.DECAY_LAMBDA * 180)
         assert abs(decayed[0]["score"] - expected) < 0.02
 
     def test_no_decay_for_undated_files(self):

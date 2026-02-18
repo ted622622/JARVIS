@@ -316,7 +316,7 @@ class HybridSearch:
 
     # ── Patch T: Temporal Decay ────────────────────────────────────
 
-    DECAY_LAMBDA = 0.01  # half-life ~69 days; 30d→74%, 180d→16%
+    DECAY_LAMBDA = 0.0154  # half-life ~45 days; 30d→63%, 90d→25% (Patch T+)
 
     @staticmethod
     def _extract_date_from_source(source: str) -> datetime | None:

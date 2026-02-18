@@ -1115,7 +1115,7 @@ class TestZhipuTTS:
 
     @pytest.mark.asyncio
     async def test_zhipu_per_persona_voice(self, tmp_path):
-        """JARVIS uses chuichui (male), Clawra uses tongtong (female)."""
+        """JARVIS uses chuichui (male), Clawra uses douji (female, Patch T+)."""
         worker = VoiceWorker(
             cache_dir=str(tmp_path),
             zhipu_key="test-key",
@@ -1137,12 +1137,12 @@ class TestZhipuTTS:
         assert body_j["voice"] == ZHIPU_VOICE_MAP["jarvis"]
         assert body_j["voice"] == "chuichui"
 
-        # Clawra → tongtong (female)
+        # Clawra → douji (female, Patch T+)
         out_c = tmp_path / "c.mp3"
         await worker._zhipu_tts("test", "clawra", out_c)
         body_c = mock_client.post.call_args[1]["json"]
         assert body_c["voice"] == ZHIPU_VOICE_MAP["clawra"]
-        assert body_c["voice"] == "tongtong"
+        assert body_c["voice"] == "douji"
 
 
 class TestTTSFallbackChain:
@@ -1224,7 +1224,19 @@ class TestVoiceTextCleaner:
 # ── Selfie Worker Dual Mode ──────────────────────────────────
 
 
+class TestClawraVoiceIsDoji:
+    """Patch T+: Clawra voice should be douji."""
+
+    def test_clawra_voice_is_douji(self):
+        assert ZHIPU_VOICE_MAP["clawra"] == "douji"
+
+    def test_jarvis_voice_unchanged(self):
+        assert ZHIPU_VOICE_MAP["jarvis"] == "chuichui"
+
+
 class TestSelfieDualMode:
+    """Backward-compat: old detect_mode / build_prompt still work."""
+
     def test_detect_direct_cafe(self):
         from workers.selfie_worker import detect_mode
         assert detect_mode("在咖啡廳拍張自拍") == "direct"
@@ -1248,8 +1260,7 @@ class TestSelfieDualMode:
     def test_build_prompt_direct(self):
         from workers.selfie_worker import build_prompt
         prompt = build_prompt("cafe with latte", "direct")
-        assert "close-up selfie" in prompt
-        assert "eye contact" in prompt
+        assert "half-body" in prompt  # Patch T+: direct now maps to medium
         assert "cafe with latte" in prompt
 
     def test_build_prompt_mirror(self):

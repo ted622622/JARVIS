@@ -95,6 +95,7 @@ class SelfieSkill:
         persona: str = "clawra",
         growth_content: str = "",
         season: str | None = None,
+        framing: str | None = None,
     ) -> SelfieResult:
         """Generate a Clawra selfie (single attempt, no retry).
 
@@ -104,11 +105,12 @@ class SelfieSkill:
             persona: "clawra" or "jarvis" — affects delayed delivery caption
             growth_content: raw SOUL_GROWTH.md for preference parsing (Patch Q)
             season: override Seoul season (default: auto-detect)
+            framing: framing type (mirror/full_body/medium/closeup) — Patch T+
 
         Returns:
             SelfieResult with image URL and metadata
         """
-        # Patch Q: Randomize appearance (hairstyle + outfit + optional scene)
+        # Patch Q + T+: Randomize appearance (hairstyle + outfit + scene)
         from core.appearance import AppearanceBuilder
 
         builder = AppearanceBuilder()
@@ -118,8 +120,16 @@ class SelfieSkill:
             growth_content=growth_content,
             season=season,
             include_scene=not _has_user_location,
+            framing=framing,
         )
-        full_prompt = f"{CORE_DNA_PROMPT} {appearance}. {scene}"
+
+        # Build full prompt: when framing is specified, use framing prompt
+        if framing:
+            from workers.selfie_worker import build_framing_prompt
+            framing_prompt = build_framing_prompt(scene, framing)
+            full_prompt = f"{CORE_DNA_PROMPT} {appearance}. {framing_prompt}"
+        else:
+            full_prompt = f"{CORE_DNA_PROMPT} {appearance}. {scene}"
         logger.info(f"Selfie prompt appearance: {appearance[:80]}")
         result = SelfieResult(attempts=1)
 
@@ -271,6 +281,7 @@ async def execute(scene: str = "casual selfie, natural light", **kwargs: Any) ->
         persona=kwargs.get("persona", "clawra"),
         growth_content=kwargs.get("growth_content", ""),
         season=kwargs.get("season"),
+        framing=kwargs.get("framing"),
     )
 
     return {

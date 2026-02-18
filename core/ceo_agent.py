@@ -202,6 +202,7 @@ class CEOAgent:
         self._flush_threshold = 20  # flush every 20 turns
         # Patch I: multi-task modules
         self._compressor = ConversationCompressor()
+        self._compressor.set_pre_flush_callback(self._pre_flush_extract)
         self._task_router = TaskRouter()
         self._help_engine = HelpDecisionEngine()
         # Patch J: soul evolution
@@ -561,6 +562,10 @@ class CEOAgent:
         # I3: Track assistant reply in compressor
         self._compressor.add_turn("assistant", reply if isinstance(reply, str) else str(reply))
 
+        # Patch T+: Pre-compaction flush — extract important info before discard
+        if self._compressor.has_pending_flush:
+            asyncio.create_task(self._compressor.flush_pending())
+
         # J2+J3: Soul growth — learn from conversation
         reply_str = reply if isinstance(reply, str) else str(reply)
         if self._soul_growth:
@@ -870,10 +875,13 @@ class CEOAgent:
                 if meta:
                     logger.info(f"CEO invoking skill: {skill_name}")
                     try:
-                        # Patch Q: Pass growth_content for selfie appearance variation
+                        # Patch Q + T+: Pass growth_content + framing for selfie
                         extra_kwargs: dict[str, Any] = {}
-                        if skill_name == "selfie" and self.soul:
-                            extra_kwargs["growth_content"] = self.soul.get_growth_content("clawra") or ""
+                        if skill_name == "selfie":
+                            if self.soul:
+                                extra_kwargs["growth_content"] = self.soul.get_growth_content("clawra") or ""
+                            from workers.selfie_worker import detect_framing
+                            extra_kwargs["framing"] = detect_framing(user_message)
                         result = await self.skills.invoke(skill_name, scene=user_message, **extra_kwargs)
                     except Exception as e:
                         logger.warning(f"Skill '{skill_name}' failed: {e}")
@@ -1498,6 +1506,57 @@ class CEOAgent:
 
         except Exception as e:
             logger.debug(f"Memory flush failed: {e}")
+
+    # ── Patch T+: Pre-compaction memory flush ────────────────────
+
+    async def _pre_flush_extract(self, turns: list[dict]) -> None:
+        """Extract important facts from turns about to be compressed.
+
+        Called by ConversationCompressor before discarding old turns.
+        Uses Lite model for cheap extraction, writes to daily memory.
+        Fully guarded — failure only logs a warning.
+        """
+        if not self.md_memory or not turns:
+            return
+
+        try:
+            # Build conversation snippet (first 200 chars per turn)
+            lines = []
+            for t in turns:
+                role = t.get("role", "?")
+                content = t.get("content", "")[:200]
+                lines.append(f"{role}: {content}")
+            conv_text = "\n".join(lines)
+
+            prompt = (
+                "從以下即將被壓縮的對話片段中，提取任何值得長期記住的事實。\n"
+                "每行一條，用「FACT:」開頭。純閒聊輸出 NONE。\n"
+                "只提取：用戶偏好、重要決定、任務進度、承諾事項。\n\n"
+                f"{conv_text[:3000]}"
+            )
+
+            response = await self.router.chat(
+                [ChatMessage(role="user", content=prompt)],
+                role=ModelRole.CEO,
+                task_type="template",
+                max_tokens=200,
+                temperature=0.1,
+            )
+
+            answer = response.content.strip()
+            if answer == "NONE" or not answer:
+                return
+
+            for line in answer.split("\n"):
+                line = line.strip()
+                if line.startswith("FACT:"):
+                    fact = line[5:].strip()
+                    if fact:
+                        self.md_memory.log_daily(f"[pre-flush] {fact}")
+
+            logger.info(f"Pre-flush extraction completed ({len(turns)} turns)")
+        except Exception as e:
+            logger.warning(f"Pre-flush extraction failed: {e}")
 
     # ── Pending Selfie Management (Patch M) ──────────────────────
 

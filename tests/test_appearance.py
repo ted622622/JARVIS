@@ -1,4 +1,4 @@
-"""Tests for core.appearance — Patch Q: Selfie appearance variation."""
+"""Tests for core.appearance — Patch Q + T+: Selfie appearance variation."""
 
 from __future__ import annotations
 
@@ -12,6 +12,11 @@ from core.appearance import (
     HAIRSTYLES,
     OUTFITS,
     SCENES,
+    MIRROR_SCENES,
+    FULL_BODY_SCENES,
+    MEDIUM_SCENES,
+    CLOSEUP_SCENES,
+    FRAMING_SCENES,
     AppearanceBuilder,
     get_seoul_season,
     parse_preferences,
@@ -244,3 +249,101 @@ class TestDataIntegrity:
         for season, outfits in OUTFITS.items():
             for o in outfits:
                 assert isinstance(o, str) and len(o) > 10
+
+
+# ── Patch T+: Framing scene pools ─────────────────────────────────
+
+
+class TestFramingScenes:
+    """Verify framing-specific scene pools exist and are non-empty."""
+
+    def test_framing_scenes_dict_has_all_keys(self):
+        assert set(FRAMING_SCENES.keys()) == {"mirror", "full_body", "medium", "closeup"}
+
+    def test_mirror_scenes_non_empty(self):
+        assert len(MIRROR_SCENES) >= 4
+        for s in MIRROR_SCENES:
+            assert isinstance(s, str) and len(s) > 10
+
+    def test_full_body_scenes_non_empty(self):
+        assert len(FULL_BODY_SCENES) >= 4
+        for s in FULL_BODY_SCENES:
+            assert isinstance(s, str) and len(s) > 10
+
+    def test_medium_scenes_non_empty(self):
+        assert len(MEDIUM_SCENES) >= 6
+        for s in MEDIUM_SCENES:
+            assert isinstance(s, str) and len(s) > 10
+
+    def test_closeup_scenes_non_empty(self):
+        assert len(CLOSEUP_SCENES) >= 4
+        for s in CLOSEUP_SCENES:
+            assert isinstance(s, str) and len(s) > 10
+
+
+class TestSelectScene:
+    """AppearanceBuilder.select_scene picks from the right pool."""
+
+    def setup_method(self):
+        self.builder = AppearanceBuilder()
+
+    @pytest.mark.parametrize("framing,pool", [
+        ("mirror", MIRROR_SCENES),
+        ("full_body", FULL_BODY_SCENES),
+        ("medium", MEDIUM_SCENES),
+        ("closeup", CLOSEUP_SCENES),
+    ])
+    def test_select_scene_from_correct_pool(self, framing, pool):
+        for _ in range(20):
+            scene = self.builder.select_scene(framing)
+            assert scene in pool, f"{framing}: got '{scene}' not in pool"
+
+    def test_select_scene_unknown_falls_back_to_scenes(self):
+        """Unknown framing should fall back to generic SCENES."""
+        scene = self.builder.select_scene("unknown_framing")
+        assert scene in SCENES
+
+
+class TestSelectProactiveFraming:
+    """Proactive framing should return varied results."""
+
+    def test_returns_valid_framing(self):
+        for _ in range(50):
+            framing = AppearanceBuilder.select_proactive_framing()
+            assert framing in ("mirror", "full_body", "medium", "closeup")
+
+    def test_produces_variety(self):
+        results = set()
+        for _ in range(100):
+            results.add(AppearanceBuilder.select_proactive_framing())
+        assert len(results) >= 2, f"Only got {results} in 100 trials"
+
+
+class TestBuildWithFraming:
+    """build() with framing parameter uses framing-specific scene pool."""
+
+    def setup_method(self):
+        self.builder = AppearanceBuilder()
+
+    def test_build_with_mirror_framing(self):
+        result = self.builder.build(season="winter", framing="mirror")
+        # The scene portion should be from MIRROR_SCENES
+        found = any(s in result for s in MIRROR_SCENES)
+        assert found, f"No mirror scene in: {result}"
+
+    def test_build_with_closeup_framing(self):
+        result = self.builder.build(season="summer", framing="closeup")
+        found = any(s in result for s in CLOSEUP_SCENES)
+        assert found, f"No closeup scene in: {result}"
+
+    def test_build_without_framing_uses_generic(self):
+        """Without framing, should use generic SCENES pool."""
+        result = self.builder.build(season="spring")
+        found = any(s in result for s in SCENES)
+        assert found, f"No generic scene in: {result}"
+
+    def test_build_framing_none_same_as_no_framing(self):
+        """framing=None should behave like no framing."""
+        # Just verify it doesn't crash
+        result = self.builder.build(season="autumn", framing=None)
+        assert isinstance(result, str) and len(result) > 10
