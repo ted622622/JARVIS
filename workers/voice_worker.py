@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import html
+import io
 import re
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -151,7 +153,22 @@ class VoiceWorker:
                 )
                 return False
 
-            out_path.write_bytes(resp.content)
+            # GLM-TTS WAV contains a non-standard AIGC metadata chunk that
+            # causes beep artifacts in Telegram voice playback.
+            # Re-write as a clean WAV using stdlib wave module.
+            raw_wav = resp.content
+            try:
+                src = wave.open(io.BytesIO(raw_wav), "rb")
+                params = src.getparams()
+                frames = src.readframes(src.getnframes())
+                src.close()
+                with wave.open(str(out_path), "wb") as dst:
+                    dst.setparams(params)
+                    dst.writeframes(frames)
+            except Exception as wav_err:
+                logger.debug(f"WAV re-write skipped ({wav_err}), using raw")
+                out_path.write_bytes(raw_wav)
+
             size = out_path.stat().st_size
             if size == 0:
                 out_path.unlink(missing_ok=True)
