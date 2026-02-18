@@ -249,16 +249,19 @@ class VoiceWorker:
                 tmp_wav = out_path.with_suffix(".tmp.wav")
                 try:
                     tmp_wav.write_bytes(trimmed_wav)
+                    # Convert to OGG/OPUS (Telegram native voice format)
+                    # + 50ms fade-in as safety net against any residual click
                     result = subprocess.run(
                         [
                             "ffmpeg", "-y", "-i", str(tmp_wav),
-                            "-codec:a", "libmp3lame", "-b:a", "128k",
-                            "-ar", "24000", str(out_path),
+                            "-af", "afade=in:st=0:d=0.05",
+                            "-codec:a", "libopus", "-b:a", "64k",
+                            "-ar", "48000", str(out_path),
                         ],
                         capture_output=True, timeout=15,
                     )
                     if result.returncode != 0:
-                        logger.warning(f"ffmpeg WAV→MP3 failed: {result.stderr[:200]}")
+                        logger.warning(f"ffmpeg WAV→OGG failed: {result.stderr[:200]}")
                         out_path.write_bytes(trimmed_wav)
                 finally:
                     tmp_wav.unlink(missing_ok=True)
@@ -360,17 +363,12 @@ class VoiceWorker:
         persona: str = "jarvis",
         emotion: str | None = None,
     ) -> str:
-        """Generate MP3 audio from text.
+        """Generate audio from text.
 
-        Three-tier fallback: GLM-TTS → Azure Speech → edge-tts.
-
-        Args:
-            text: Text to synthesize
-            persona: "jarvis" or "clawra" (determines voice)
-            emotion: CEO emotion label (reserved for future use)
+        Three-tier fallback: GLM-TTS (OGG/OPUS) → Azure Speech (MP3) → edge-tts (MP3).
 
         Returns:
-            Path to the generated MP3 file
+            Path to the generated audio file
 
         Raises:
             VoiceError: If all TTS engines fail
@@ -381,22 +379,25 @@ class VoiceWorker:
         if not text.strip():
             raise VoiceError("Empty text provided for TTS")
 
-        out_path = self._cache_path(text, persona)
+        # GLM-TTS outputs OGG/OPUS (Telegram native), fallbacks output MP3
+        ogg_path = self._cache_path(text, persona, ext=".ogg")
+        mp3_path = self._cache_path(text, persona, ext=".mp3")
 
-        # Return cached version if exists and non-empty
-        if out_path.exists() and out_path.stat().st_size > 0:
-            logger.debug(f"TTS cache hit: {out_path.name}")
-            return str(out_path)
+        # Return cached version if exists and non-empty (either format)
+        for cached in (ogg_path, mp3_path):
+            if cached.exists() and cached.stat().st_size > 0:
+                logger.debug(f"TTS cache hit: {cached.name}")
+                return str(cached)
 
-        # Three-tier fallback: GLM-TTS (WAV→MP3 via ffmpeg) → Azure → edge-tts
-        if await self._zhipu_tts(text, persona, out_path):
-            return str(out_path)
+        # Three-tier fallback: GLM-TTS (WAV→OGG) → Azure (MP3) → edge-tts (MP3)
+        if await self._zhipu_tts(text, persona, ogg_path):
+            return str(ogg_path)
 
-        if await self._azure_tts(text, persona, out_path):
-            return str(out_path)
+        if await self._azure_tts(text, persona, mp3_path):
+            return str(mp3_path)
 
-        if await self._edge_tts(text, persona, out_path):
-            return str(out_path)
+        if await self._edge_tts(text, persona, mp3_path):
+            return str(mp3_path)
 
         raise VoiceError("All TTS engines failed")
 
