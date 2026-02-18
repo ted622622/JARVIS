@@ -320,9 +320,22 @@ class VoiceTextCleaner:
         "\U0001FA00-\U0001FA6F"  # extended symbols
         "\U0001FA70-\U0001FAFF"  # extended-A
         "\U00002702-\U000027B0"  # dingbats
+        "\U00002300-\U000023FF"  # misc technical (⏰⌚ etc.)
         "\U00002600-\U000026FF"  # misc symbols
+        "\U00002B05-\U00002B55"  # arrows & geometric emoji
         "\U0000FE00-\U0000FE0F"  # variation selectors
+        "\U000020E3"             # combining keycap
         "\U0000200D"             # ZWJ
+        "\U000000A9"             # ©
+        "\U000000AE"             # ®
+        "\U0000203C"             # ‼
+        "\U00002049"             # ⁉
+        "\U00002934-\U00002935"  # ⤴⤵
+        "\U000025AA-\U000025FE"  # geometric shapes
+        "\U00003030"             # 〰
+        "\U0000303D"             # 〽
+        "\U00003297"             # ㊗
+        "\U00003299"             # ㊙
         "]+",
         flags=re.UNICODE,
     )

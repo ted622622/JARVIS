@@ -81,6 +81,28 @@ _TASK_TEMPLATE_PATTERN = re.compile(r"（[^）]*內容[^）]*）|（[^）]*填�
 # GitHub repo references: owner/repo patterns (for proactive fetch in task templates)
 _GITHUB_REPO_PATTERN = re.compile(r'\b([A-Za-z][\w.-]+/[A-Za-z][\w.-]+)\b')
 
+# ── LLM reply cleanup (strip leaked thinking tags) ────────────────
+_THINK_TAG_PATTERN = re.compile(r"</?think>", re.IGNORECASE)
+_THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_WRAPPING_CODE_BLOCK = re.compile(r"^```(?:\w*)\n?(.*?)```$", re.DOTALL)
+
+
+def _clean_llm_reply(text: str) -> str:
+    """Strip leaked thinking tags and wrapping code blocks from LLM output."""
+    if not text:
+        return text
+    # Remove full <think>...</think> blocks first
+    text = _THINK_BLOCK_PATTERN.sub("", text)
+    # Remove stray </think> or <think> tags
+    text = _THINK_TAG_PATTERN.sub("", text)
+    # Remove wrapping code blocks (```...\ncontent\n```)
+    text = text.strip()
+    m = _WRAPPING_CODE_BLOCK.match(text)
+    if m:
+        text = m.group(1).strip()
+    return text.strip()
+
+
 # ── H1 v2: Task Resolution Chains ────────────────────────────────
 # CLI/API first → httpx → browser (last resort) → partial assist
 # Each chain entry: {"method": str, "worker": str, "timeout": int}
@@ -504,7 +526,7 @@ class CEOAgent:
             role=ModelRole.CEO,
             max_tokens=ceo_max_tokens,
         )
-        reply = response.content
+        reply = _clean_llm_reply(response.content)
 
         # 5b. Reactive fallback: if LLM outputs [FETCH:]/[SEARCH:]/[MAPS:], execute
         # Loop up to 3 rounds to handle multiple tool calls
@@ -538,7 +560,7 @@ class CEOAgent:
             followup = await self.router.chat(
                 messages, role=ModelRole.CEO, max_tokens=4096,
             )
-            reply = followup.content
+            reply = _clean_llm_reply(followup.content)
             logger.debug(f"Tool-use round {_tool_round + 1} reply length: {len(reply or '')}")
 
         # Patch O: Log reply before returning + empty reply guard
