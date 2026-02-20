@@ -1,10 +1,9 @@
-# Memory Growth — 記憶成長 Skill
-
 ---
 name: memory-growth
 description: 根據互動更新 agent 的記憶
-triggers: [重要互動, 記憶更新]
 ---
+
+# Memory Growth — 記憶成長 Skill
 
 ## 記憶層級
 
