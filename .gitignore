@@ -1,0 +1,53 @@
+# Secrets
+.secrets.json
+.secrets
+**/auth.json
+**/auth-profiles.json
+**/device-auth.json
+credentials/
+*.pem
+*.key
+
+# Tokens
+**/google_tokens.json
+**/token*.json
+
+# Sessions
+agents/*/sessions/*.jsonl
+
+# Logs
+logs/
+*.log
+
+# Temp
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Media
+media/inbound/
+media/outbound/
+
+# Browser
+browser/
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Windows special files
+nul
+
