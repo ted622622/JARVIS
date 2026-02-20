@@ -8,6 +8,9 @@ credentials/
 *.pem
 *.key
 
+# Config with secrets
+openclaw.json
+
 # Tokens
 **/google_tokens.json
 **/token*.json
