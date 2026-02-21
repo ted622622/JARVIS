@@ -68,12 +68,72 @@ openclaw pairing approve 09e03276-a5f2-42e2-8a3e-33fc4617aa3d
 9. ✅ YouTube 策略驗證依賴安裝
 10. ✅ Obsidian 文章整理設定
 
-## 待完成
+## 待完成（優先順序）
 
-1. ⏸️ 測試 JARVIS 調度 OpenCode
-2. ⏸️ 測試各 Agent 的網絡搜索/網頁讀取
-3. ⏸️ YouTube 策略驗證流程實作
-4. ⏸️ 細調各 Agent 的 SOUL（參考 MEMORY.md 的專業化設計範例）
+### 高優先級
+
+1. **OpenClaw 維運排程實作**（進行中）
+   - 每日備份（Marcus）15:00
+   - 版本更新前備份
+   - 記憶維護（每兩週，先備份再清理）
+   - Gateway 重啟（>500MB 觸發）
+
+### 待做
+
+2. **YouTube 策略驗證流程實作**
+3. **細調各 Agent 的 SOUL**
+
+---
+
+## 維運排程規格
+
+### 每日備份（Marcus，15:00）
+
+| 項目 | 內容 |
+|------|------|
+| 備份內容 | workspace/memory/, workspace/*.md, workspace/clawra/, workspace/marcus/, workspace/quant/ |
+| 本機路徑 | C:\ted\backup\openclaw\ |
+| 本機保留 | 3 份 |
+| Email | Marcus 寄給自己 |
+| Email 保留 | 2 份 |
+| 額外 | 清理舊 session 檔 |
+
+### 版本更新前備份
+
+Ted 通知 JARVIS → JARVIS 觸發 Marcus 備份 → 確認完成 → 通知 Ted
+
+### 記憶維護（每兩週）
+
+1. **先備份**（同每日備份）
+2. 掃描 memory 檔
+3. 整理建議清單
+4. **主動詢問 Ted 確認**
+5. Ted 確認後執行
+6. 回報變更摘要
+
+⚠️ 未經 Ted 確認不得修改 memory
+
+### Gateway 重啟（JARVIS）
+
+| 觸發條件 | 說明 |
+|---------|------|
+| Gateway > 500MB | 詢問 Ted 是否重啟 |
+| 超過 7 天未重啟 | 等待所有 agent 空閒後詢問 |
+| Session 15 分鐘無動作 = 空閒 |
+
+---
+
+## ⚠️ 重要教訓：Git 絕對不能泄露 API Key
+
+**已發生 2 次泄露**：
+1. Telegram Bot Token
+2. Gemini API Key
+
+**預防措施**：
+- 所有 `.env` 檔案在 `.gitignore`
+- `openclaw.json` 在 `.gitignore`
+- Commit 前檢查：`git diff --staged`
+- 若已泄露：立即重新產生 key + git filter-branch 或 reset --hard
 
 ## 已知問題
 

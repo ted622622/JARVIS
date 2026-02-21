@@ -1,6 +1,8 @@
 # Secrets
 .secrets.json
 .secrets
+skills/*/.env
+**/.env
 **/auth.json
 **/auth-profiles.json
 **/device-auth.json
