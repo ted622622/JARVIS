@@ -42,6 +42,8 @@ node_modules/
 __pycache__/
 *.pyc
 .env
+**/.env
+skills/*/.env
 
 # IDE
 .vscode/
